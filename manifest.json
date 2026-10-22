@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-asus.g16",
+  "name": "G16 Control",
+  "version": "1.3.0",
+  "author": "omarchy-asus",
+  "description": "ASUS ROG Zephyrus G16 in one Omarchy panel: keyboard and lid Slash LEDs, per-charger keyboard, refresh rate, backlight and CPU power limits, battery charge limit, Fn+Super. Event-driven, one bundled Python bridge, nothing to install on stock Omarchy. Part of omarchy-asus (kernel, NVIDIA and Omarchy fixes for ASUS ROG laptops).",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "G16 Control",
+    "description": "Zephyrus G16 hardware in one panel: keyboard and lid Slash LEDs, panel refresh rate, and battery charge ceiling",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/omarchy-asus/omarchy-asus"
+}

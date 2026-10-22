@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install dbus-daemon and PyGObject
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq dbus-daemon python3-gi gir1.2-glib-2.0
+      - name: Bridge (fake asusd, UPower, logind, systemd and Hyprland)
+        run: /usr/bin/python3 -I tests/bridge_test.py
+      - name: Slash cursor
+        run: node tests/cursor.test.js
+      - name: Manifest
+        run: python3 -c "import json; m = json.load(open('manifest.json')); assert m['id'] == 'omarchy-asus.g16' and m['entryPoints']"
