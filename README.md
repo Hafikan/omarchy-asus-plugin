@@ -104,8 +104,9 @@ refresh pin (the panel's 60/240/Auto switch, stored in
 A monitor hotplug or `hyprctl reload` re-applies `monitors.lua`, which puts the
 panel back on its native rate; the widget sets the rate again after both.
 
-The widget also works without asusd: the keyboard and Slash tabs hide, and the
-refresh rate, charge limit and Fn+Super switch stay.
+The widget also works without asusd: the keyboard, Slash, charge limit and
+power limit sections hide, and the refresh rate, screen dimming and Fn+Super
+switch stay.
 
 ## How it works: one Python bridge, nothing polls
 

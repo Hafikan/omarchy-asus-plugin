@@ -638,8 +638,10 @@ class Bridge:
             flags = [bool(x) for x in entry[1:5]]
         except (TypeError, IndexError, KeyError):
             pass
-        charge = charge_limit_sysfs()
+        # Only asusd can set the limit, so without it the section hides (0).
+        charge = 0
         if self.charge:
+            charge = charge_limit_sysfs()
             charge = int(self.cache.get(self.charge, {}).get(CHARGE_PROP, charge) or charge)
         pin = pinned_hz()
         s = {

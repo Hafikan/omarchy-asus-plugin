@@ -406,6 +406,7 @@ class BridgeTest(unittest.TestCase):
         h = self.harness(asusd=False)
         h.wait(lambda: h.state.get("refreshHz") == 240, what="started")
         self.assertFalse(h.state["hasAura"])
+        self.assertEqual(h.state["chargeLimit"], 0, "no asusd: the charge limit can't be set, so it hides")
         self.assertFalse(h.send("kbd-color", "112233")["ok"])
         h.fake({"asusd": True})
         h.wait(lambda: h.state.get("hasAura") and h.state.get("hasSlash"), what="asusd found")
