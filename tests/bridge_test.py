@@ -138,7 +138,7 @@ class Harness:
         self.led = os.path.join(self.sys, "class", "leds", "asus::kbd_backlight", "brightness_hw_changed")
         with open(self.led, "w") as f:
             f.write("1\n")
-        self.conf = os.path.join(self.home, ".config", "omarchy", "power-tune.conf")
+        self.conf = os.path.join(self.home, ".config", "omarchy", "omarchy-asus.conf")
         self.state_dir = os.path.join(self.home, ".local", "state", "omarchy")
         if conf is not None:
             os.makedirs(os.path.dirname(self.conf))
@@ -342,7 +342,7 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: h.hypr.hz == 165 and h.state.get("gaming"), what="gaming rate")
         self.assertTrue(h.send("refresh", "120")["ok"])
         h.wait(lambda: h.hypr.hz == 120 and h.state.get("refreshOverride") == "120", what="pinned rate")
-        with open(os.path.join(h.state_dir, "power-tune-hz")) as f:
+        with open(os.path.join(h.state_dir, "omarchy-asus-hz")) as f:
             self.assertEqual(f.read().strip(), "120")
         self.assertTrue(h.send("refresh", "auto")["ok"])
         h.wait(lambda: h.hypr.hz == 165, what="back to gaming")
@@ -486,11 +486,11 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(calls, [["backlight", "amdgpu_bl1", 30], ["backlight", "amdgpu_bl1", 80],
                                  ["backlight", "amdgpu_bl1", 30]])
 
-    def test_the_g16s_power_tune_conf_works_as_is(self):
-        # The live file from the G16 (tests/power-tune.g16.conf): a desc: panel
-        # match, keys only power-tune knew (UPOWER_EVENTS, POLL_SECS, HYPR_EVENTS),
+    def test_the_g16s_settings_file_works_as_is(self):
+        # The live file from the G16 (tests/g16.conf): a desc: panel
+        # match, keys from an older tool (UPOWER_EVENTS, POLL_SECS, HYPR_EVENTS),
         # quoted values and BRIGHT_BATTERY.
-        with open(os.path.join(HERE, "power-tune.g16.conf")) as f:
+        with open(os.path.join(HERE, "g16.conf")) as f:
             conf = f.read()
         h = self.harness(conf=conf, charge_mode=1, bright=70)
         h.wait(lambda: h.state.get("hasAura") and h.state.get("refreshHz") == 240, what="barrel applied")
@@ -528,15 +528,15 @@ class BridgeTest(unittest.TestCase):
                  and "/xyz/ljones" in c["set"][0] and "panel_overdrive" not in c["set"][0]]
         self.assertEqual(order[:3], ["curve", "EnablePptGroup", "CurrentValue"], "curve, group, then limits")
         state = lambda n: open(os.path.join(h.state_dir, n)).read().strip()
-        self.assertEqual((state("g16-ppt-curves"), state("g16-ppt-groups")), ("0", "ac 0"))
+        self.assertEqual((state("omarchy-asus-ppt-curves"), state("omarchy-asus-ppt-groups")), ("0", "ac 0"))
         h.power(True)                       # unplugged: curve off; the AC group can't be reached on DC
         h.wait(lambda: h.curve_calls()[-1:] == [[0, "CPU", False]], what="curve off")
-        self.assertEqual((state("g16-ppt-curves"), state("g16-ppt-groups")), ("", "ac 0"))
+        self.assertEqual((state("omarchy-asus-ppt-curves"), state("omarchy-asus-ppt-groups")), ("", "ac 0"))
         self.assertEqual(h.group_sets(), [[True, "plugged", 0]])
         h.set_charge_mode(1)
         h.power(False)                      # the OEM barrel: the AC group is current again, so it goes off
         h.wait(lambda: h.group_sets()[-1:] == [[False, "plugged", 0]], what="group off")
-        self.assertEqual(state("g16-ppt-groups"), "")
+        self.assertEqual(state("omarchy-asus-ppt-groups"), "")
 
     def test_no_limit_keys_touch_nothing(self):
         h = self.harness(charge_mode=2)
@@ -583,7 +583,7 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: h.curve_calls() == [[0, "CPU", True]], what="curve on, profile 0")
         h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "PlatformProfile", "u", 3]})
         h.wait(lambda: h.curve_calls()[1:] == [[0, "CPU", False], [3, "CPU", True]], what="curve moved to 3")
-        with open(os.path.join(h.state_dir, "g16-ppt-curves")) as f:
+        with open(os.path.join(h.state_dir, "omarchy-asus-ppt-curves")) as f:
             self.assertEqual(f.read().strip(), "3")
 
     def test_a_group_the_user_enabled_is_left_alone(self):
@@ -595,13 +595,13 @@ class BridgeTest(unittest.TestCase):
         h.power(False)
         h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits")
         self.assertEqual(h.group_sets(), [], "it was already on: not touched")
-        self.assertEqual(open(os.path.join(h.state_dir, "g16-ppt-groups")).read().strip() if
-                         os.path.exists(os.path.join(h.state_dir, "g16-ppt-groups")) else "", "")
+        self.assertEqual(open(os.path.join(h.state_dir, "omarchy-asus-ppt-groups")).read().strip() if
+                         os.path.exists(os.path.join(h.state_dir, "omarchy-asus-ppt-groups")) else "", "")
 
     def test_a_curve_left_on_by_a_crash_is_turned_off(self):
-        h = self.harness(on_battery=True, state_files={"g16-ppt-curves": "2\n"})
+        h = self.harness(on_battery=True, state_files={"omarchy-asus-ppt-curves": "2\n"})
         h.wait(lambda: h.curve_calls() == [[2, "CPU", False]], what="stale curve off")
-        with open(os.path.join(h.state_dir, "g16-ppt-curves")) as f:
+        with open(os.path.join(h.state_dir, "omarchy-asus-ppt-curves")) as f:
             self.assertEqual(f.read().strip(), "")
 
     # ---- the bridge's own file writes: no symlink ever redirects one ----
@@ -611,8 +611,8 @@ class BridgeTest(unittest.TestCase):
             h.victim = os.path.join(h.tmp, "victim")
             with open(h.victim, "w") as f:
                 f.write("precious\n")
-            os.symlink(h.victim, os.path.join(h.state_dir, "power-tune-hz"))
-            os.symlink(h.victim, os.path.join(h.state_dir, "power-tune-gaming"))
+            os.symlink(h.victim, os.path.join(h.state_dir, "omarchy-asus-hz"))
+            os.symlink(h.victim, os.path.join(h.state_dir, "omarchy-asus-gaming"))
         h = self.harness(before=plant)
         h.wait(lambda: h.state.get("hasAura"), what="started")
         self.assertFalse(h.state["gaming"], "a link is not a gaming flag")
@@ -622,12 +622,12 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("symbolic link", r["error"])
         self.assertFalse(h.send("gaming", "on")["ok"])
         self.assertEqual(open(h.victim).read(), "precious\n")
-        self.assertTrue(os.path.islink(os.path.join(h.state_dir, "power-tune-hz")))
+        self.assertTrue(os.path.islink(os.path.join(h.state_dir, "omarchy-asus-hz")))
 
     def test_a_linked_settings_file_is_neither_read_nor_written_through(self):
         def link(h):
             os.makedirs(os.path.dirname(h.conf))
-            h.real_conf = os.path.join(h.tmp, "dotfiles-power-tune.conf")
+            h.real_conf = os.path.join(h.tmp, "dotfiles-omarchy-asus.conf")
             with open(h.real_conf, "w") as f:
                 f.write(CONF)
             os.symlink(h.real_conf, h.conf)
@@ -664,6 +664,22 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(h.elsewhere, "state", "omarchy")), [],
                          "nothing written below the linked ancestor")
 
+    def test_files_under_their_old_names_are_renamed_once(self):
+        def old(h):
+            os.makedirs(os.path.dirname(h.conf))
+            with open(os.path.join(os.path.dirname(h.conf), "power-tune.conf"), "w") as f:
+                f.write(CONF)
+            os.makedirs(h.state_dir, exist_ok=True)
+            with open(os.path.join(h.state_dir, "power-tune-hz"), "w") as f:
+                f.write("60\n")
+        h = self.harness(conf=None, before=old)
+        h.wait(lambda: h.state.get("refreshOverride") == "60", what="the old pin read under its new name")
+        self.assertEqual(h.state["kbdAC"], "med", "the old settings read under the new name")
+        self.assertEqual(open(h.conf).read(), CONF)
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(h.conf), "power-tune.conf")))
+        self.assertTrue(os.path.exists(os.path.join(h.state_dir, "omarchy-asus-hz")))
+        self.assertFalse(os.path.exists(os.path.join(h.state_dir, "power-tune-hz")))
+
     def test_writes_leave_no_temp_files(self):
         h = self.harness()
         h.wait(lambda: h.state.get("hasAura"), what="started")
@@ -672,8 +688,8 @@ class BridgeTest(unittest.TestCase):
             self.assertTrue(h.send(*args)["ok"], args)
         for d in (h.state_dir, os.path.dirname(h.conf)):
             self.assertEqual([n for n in os.listdir(d) if n.endswith(".tmp")], [], d)
-        self.assertEqual(oct(os.stat(os.path.join(h.state_dir, "power-tune-hz")).st_mode & 0o777)
-                         if os.path.exists(os.path.join(h.state_dir, "power-tune-hz")) else "gone", "gone")
+        self.assertEqual(oct(os.stat(os.path.join(h.state_dir, "omarchy-asus-hz")).st_mode & 0o777)
+                         if os.path.exists(os.path.join(h.state_dir, "omarchy-asus-hz")) else "gone", "gone")
 
     def test_a_huge_hyprland_reply_is_capped(self):
         h = self.harness(giant_hyprland=True)
@@ -703,7 +719,7 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(h.curve_calls()[-1:], [[0, "CPU", False]])
         self.assertEqual(h.group_sets()[-1:], [[False, "plugged", 0]])
         state = lambda n: open(os.path.join(h.state_dir, n)).read().strip()
-        self.assertEqual((state("g16-ppt-curves"), state("g16-ppt-groups")), ("", ""))
+        self.assertEqual((state("omarchy-asus-ppt-curves"), state("omarchy-asus-ppt-groups")), ("", ""))
 
     def test_closing_stdin_stops_the_bridge(self):
         h = self.harness()

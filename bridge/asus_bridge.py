@@ -20,8 +20,8 @@ What it follows, all pushed, nothing on a timer:
   - The keyboard LED's brightness_hw_changed (Fn+F2/F3 bypass asusd), and
     the settings and state files below, through inotify.
 
-Per power source (what omarchy-power-tune used to do, folded in here), from
-~/.config/omarchy/power-tune.conf (same keys, plain KEY=VALUE, never sourced):
+Per power source, from ~/.config/omarchy/omarchy-asus.conf (plain KEY=VALUE,
+never sourced):
   KBD_AC / KBD_BATTERY                  off | low | med | high
   HZ_AC / HZ_BATTERY / HZ_GAMING        refresh rate of the internal panel
   PANEL_OVERDRIVE_AC / _BATTERY         0 | 1
@@ -54,11 +54,11 @@ the group off where it's still current. A group left on by an unplug (the
 power state has changed) is turned off the next time it's current; until
 then the curve is off, and the firmware ignores stored limits without it.
 The curves and groups it turned on are kept in ~/.local/state/omarchy
-(g16-ppt-curves, g16-ppt-groups), so a crash can't leave either on. UPower reports both chargers as AC; asus-armoury's charge_mode tells
+(omarchy-asus-ppt-curves, omarchy-asus-ppt-groups), so a crash can't leave either on. UPower reports both chargers as AC; asus-armoury's charge_mode tells
 them apart (bit 0 barrel, bit 1 USB-C).
 A key that is absent is left alone: with no file nothing is enforced. The
-refresh pin (~/.local/state/omarchy/power-tune-hz, an integer) wins over
-gaming mode (power-tune-gaming exists), which wins over the power source.
+refresh pin (~/.local/state/omarchy/omarchy-asus-hz, an integer) wins over
+gaming mode (omarchy-asus-gaming exists), which wins over the power source.
 
 Only the Python standard library and PyGObject's Gio/GLib are used. Nothing
 here spawns a process or uses a shell. `asus_bridge.py gaming on|off|toggle`
@@ -137,18 +137,23 @@ def env(name, default=""):
 HOME = env("HOME", "/")
 CONFIG_HOME = env("XDG_CONFIG_HOME", os.path.join(HOME, ".config"))
 STATE_HOME = env("XDG_STATE_HOME", os.path.join(HOME, ".local", "state"))
-CONF_NAME = "power-tune.conf"
+CONF_NAME = "omarchy-asus.conf"
 CONF_PATH = os.path.join(CONFIG_HOME, "omarchy", CONF_NAME)
 STATE_DIR = os.path.join(STATE_HOME, "omarchy")
-PIN_NAME, GAMING_NAME = "power-tune-hz", "power-tune-gaming"
+PIN_NAME, GAMING_NAME = "omarchy-asus-hz", "omarchy-asus-gaming"
 HZ_PIN = os.path.join(STATE_DIR, PIN_NAME)
 GAMING_FLAG = os.path.join(STATE_DIR, GAMING_NAME)
 WINLOCK_DROPIN = os.path.join(CONFIG_HOME, "systemd", "user", WINLOCK_UNIT + ".d")
 WINLOCK_MODE_CONF = os.path.join(WINLOCK_DROPIN, "mode.conf")
-# power-tune's edge-trigger state: the source class last applied, and the
-# barrel backlight level saved when leaving it.
-SEEN_NAME, SAVED_NAME = "power-tune.source", "power-tune.bright-ac"
-CURVES_NAME, GROUPS_NAME = "g16-ppt-curves", "g16-ppt-groups"
+# The backlight step's edge-trigger state: the source class last applied, and
+# the barrel backlight level saved when leaving it.
+SEEN_NAME, SAVED_NAME = "omarchy-asus.source", "omarchy-asus.bright-ac"
+CURVES_NAME, GROUPS_NAME = "omarchy-asus-ppt-curves", "omarchy-asus-ppt-groups"
+# The names these files had before 1.6.0, renamed once (migrate_names).
+OLD_CONF_NAMES = {"power-tune.conf": CONF_NAME}
+OLD_STATE_NAMES = {"power-tune-hz": PIN_NAME, "power-tune-gaming": GAMING_NAME,
+                   "power-tune.source": SEEN_NAME, "power-tune.bright-ac": SAVED_NAME,
+                   "g16-ppt-curves": CURVES_NAME, "g16-ppt-groups": GROUPS_NAME}
 # Tests point these at a temp tree; on a real system they are the defaults.
 SYSROOT = env("G16_BRIDGE_SYSROOT", "/sys")
 WINLOCK_PATH = env("G16_BRIDGE_WINLOCK", WINLOCK_BIN)
@@ -269,6 +274,13 @@ class Dir:
         finally:
             os.close(fd)
 
+    def exists(self, name):
+        try:
+            os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+
     def is_file(self, name):
         try:
             return stat.S_ISREG(os.stat(name, dir_fd=self.fd, follow_symlinks=False).st_mode)
@@ -377,8 +389,8 @@ def write_conf_key(key, value):
         if text is None and d.is_file(CONF_NAME):
             raise OSError("the settings file can't be read")
         lines = text.splitlines() if text is not None else [
-            "# Per power source settings for the omarchy-asus plugin (and the",
-            "# omarchy-power-tune keys it replaces). A missing key is left alone."]
+            "# Per power source settings for the omarchy-asus plugin.",
+            "# A missing key is left alone."]
         done = False
         for i, line in enumerate(lines):
             if re.match(rf"^\s*{key}=", line):
@@ -821,7 +833,7 @@ class Bridge:
         except GLib.Error as e:
             log(f"UPower: {e.message}")
 
-    # ---- the per-source policy (power-tune) ----
+    # ---- the per-source policy ----
     def source(self):
         """Which settings apply: AC on the barrel (weak or not), BATTERY on
         USB-C and battery."""
@@ -1072,7 +1084,7 @@ class Bridge:
             log(f"power limits ({why}): {getattr(e, 'message', e)}")
 
     def adjust_brightness(self):
-        """power-tune's backlight step, edge-triggered on the source class
+        """The backlight step, edge-triggered on the source class
         (ac / not ac) against the last apply: leaving the barrel dims to
         BRIGHT_BATTERY % if brighter (once, not a cap); back on the barrel
         the saved level returns unless it has since gone brighter. The first
@@ -1440,7 +1452,7 @@ class Bridge:
 
 
 def cli(argv):
-    """The power-tune commands people bind to keys; the running bridge
+    """The commands people bind to keys; the running bridge
     notices the state file change and applies it."""
     if argv[0] == "gaming":
         set_gaming(argv[1] if len(argv) > 1 else "toggle")
@@ -1470,7 +1482,23 @@ def cli(argv):
     return 0
 
 
+def migrate_names():
+    """Rename the settings and state files from their pre-1.6.0 names, once:
+    only where the old name exists and the new one doesn't. A rename never
+    follows a symbolic link (a linked file is moved as a link, then refused)."""
+    for opener, names in ((config_dir, OLD_CONF_NAMES), (state_dir, OLD_STATE_NAMES)):
+        try:
+            with opener(create=False) as d:
+                for old, new in names.items():
+                    if d.exists(old) and not d.exists(new):
+                        os.rename(old, new, src_dir_fd=d.fd, dst_dir_fd=d.fd)
+                        log(f"renamed {old} to {new}")
+        except OSError:
+            pass
+
+
 def main():
+    migrate_names()
     if len(sys.argv) > 1:
         return cli(sys.argv[1:])
     try:

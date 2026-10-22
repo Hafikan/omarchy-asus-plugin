@@ -15,7 +15,7 @@ import qs.Ui
 //
 //   Keyboard backlight -- a real kernel LED (/sys/class/leds/asus::kbd_backlight)
 //     owned by asusd's xyz.ljones.Aura interface. Brightness is set per power
-//     source (KBD_AC/KBD_BATTERY in power-tune.conf): the bridge re-applies
+//     source (KBD_AC/KBD_BATTERY in omarchy-asus.conf): the bridge re-applies
 //     the level for the current source on every plug and unplug, which is why
 //     it is presented as two levels rather than one slider. Colour and
 //     power-state flags go straight to asusd.

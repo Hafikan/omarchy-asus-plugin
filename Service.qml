@@ -12,8 +12,8 @@ import Quickshell.Io
 // their own events and pushes a JSON "state" line whenever something
 // changes; commands go to it as JSON lines on stdin. It also applies the
 // per-power-source settings (keyboard level, the internal panel's refresh
-// rate, panel overdrive) that omarchy-power-tune used to, from the same
-// ~/.config/omarchy/power-tune.conf keys. Nothing here runs on a timer.
+// rate, panel overdrive) from ~/.config/omarchy/omarchy-asus.conf. Nothing
+// here runs on a timer.
 //
 // Every launch is an absolute path with an argv array and a closed,
 // allow-listed environment.

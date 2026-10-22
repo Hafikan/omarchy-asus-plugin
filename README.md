@@ -36,8 +36,8 @@ omarchy-plugin-remove io.github.omarchy-asus.panel
 ```
 
 `release` turns off the fan curves and asusd PPT tuning groups the plugin turned on for power limits, so no limit outlives it. The plugin leaves your settings in place; delete them if you want a clean slate:
-- `~/.config/omarchy/power-tune.conf`;
-- `~/.local/state/omarchy/power-tune-*`, `g16-ppt-*`;
+- `~/.config/omarchy/omarchy-asus.conf`;
+- `~/.local/state/omarchy/omarchy-asus*`;
 - `~/.config/systemd/user/g16-winlock.service.d/mode.conf`, if you changed the Fn+Super mode.
 
 ## What it touches
@@ -49,18 +49,17 @@ omarchy-plugin-remove io.github.omarchy-asus.panel
   - `logind` `SetBrightness`: the screen backlight, only if you set `BRIGHT_BATTERY`.
 - **D-Bus (session bus):** the systemd user manager, to reload, enable and restart `g16-winlock.service` when you change the Fn+Super mode.
 - **Hyprland's IPC sockets:** the monitor list, `hl.monitor()` for the internal panel's refresh rate, and hotplug/reload events.
-- **Files:** it reads and writes only `~/.config/omarchy/power-tune.conf`, `~/.local/state/omarchy/` and the Win-lock drop-in above.
+- **Files:** it reads and writes only `~/.config/omarchy/omarchy-asus.conf`, `~/.local/state/omarchy/` and the Win-lock drop-in above.
   - Directories are walked from `/` one component at a time without following symbolic links; each must be yours or a root-owned system directory.
   - Writes go to a new private temporary file that is atomically renamed into place.
-  - A symbolic link is never read or written through: keep a real `power-tune.conf` (copy it from your dotfiles), and the log says so if it is a link.
+  - A symbolic link is never read or written through: keep a real `omarchy-asus.conf` (copy it from your dotfiles), and the log says so if it is a link.
 - **Nothing runs as root,** and the plugin installs nothing system-wide.
 
 ## Per power source: keyboard, refresh rate, panel overdrive
 
-The widget applies these itself on every plug and unplug (it replaces
-`omarchy-power-tune`, which was written for this widget). They live in
-`~/.config/omarchy/power-tune.conf`, as plain `KEY=VALUE` lines (never run as a
-script):
+The widget applies these itself on every plug and unplug. They live in
+`~/.config/omarchy/omarchy-asus.conf`, as plain `KEY=VALUE` lines (never run as
+a script):
 
 | key | values | what |
 |---|---|---|
@@ -94,8 +93,8 @@ follow that curve while limits apply. The values the G16 used with rog-power:
 
 A key that isn't set is left alone, so with no file nothing is enforced. The
 refresh pin (the panel's 60/240/Auto switch, stored in
-`~/.local/state/omarchy/power-tune-hz`) wins over gaming mode
-(`power-tune-gaming`), which wins over the power source. For a key binding:
+`~/.local/state/omarchy/omarchy-asus-hz`) wins over gaming mode
+(`omarchy-asus-gaming`), which wins over the power source. For a key binding:
 
 ```bash
 /usr/bin/python3 -I ~/.config/omarchy/plugins/io.github.omarchy-asus.panel/bridge/asus_bridge.py gaming toggle
@@ -104,11 +103,6 @@ refresh pin (the panel's 60/240/Auto switch, stored in
 
 A monitor hotplug or `hyprctl reload` re-applies `monitors.lua`, which puts the
 panel back on its native rate; the widget sets the rate again after both.
-
-**Coming from `omarchy-power-tune`:** the settings file and state files are the
-same, so nothing needs converting. Disable the old `power-tune` user service
-so two programs don't set the same things. Its overdrive and refresh jobs are
-covered here; anything else you added to it is not.
 
 The widget also works without asusd: the keyboard and Slash tabs hide, and the
 refresh rate, charge limit and Fn+Super switch stay.
