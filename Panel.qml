@@ -30,8 +30,8 @@ import qs.Ui
 // `asusctl aura effect` advertises.
 Panel {
   id: root
-  moduleName: "io.github.omarchy-asus.plugin"
-  ipcTarget: "io.github.omarchy-asus.plugin"
+  moduleName: "io.github.omarchy-asus.panel"
+  ipcTarget: "io.github.omarchy-asus.panel"
 
   // All state and every process live in Service.qml, which the shell mounts
   // once (manifest kind "service"). With one bar per monitor this widget used
@@ -43,7 +43,7 @@ Panel {
   readonly property var svc: {
     var tick = root.serviceTick
     var host = root.bar ? root.bar.shell : null
-    return host && typeof host.serviceFor === "function" ? host.serviceFor("io.github.omarchy-asus.plugin") : null
+    return host && typeof host.serviceFor === "function" ? host.serviceFor("io.github.omarchy-asus.panel") : null
   }
   readonly property var g: root.svc ? root.svc : localSvc.item
 
@@ -402,6 +402,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: "Applied again on every plug and unplug, so they are set here "
                     + "rather than as one live slider."
@@ -458,6 +459,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 visible: !root.kbdOn
                 text: "Backlight is off, so a colour change will not be visible yet."
@@ -559,6 +561,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: slashHeader.verticalCenter
                   anchors.right: parent.right
                   text: root.slashPercent + "%"
@@ -635,6 +638,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: "Static is the steady one. Most others animate, and a few sit dark between plays. "
                     + "Arrow keys (or h/j/k/l) move, Enter picks."
@@ -716,6 +720,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Now " + root.refreshHz + "Hz. Auto follows power (60 on battery with your "
                   + "defaults). Pin 60 or 240 anytime — including on battery — if you want to "
@@ -753,6 +758,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Stopping short of full is the single biggest lever on pack "
                   + "lifespan. 100% is right before a trip, not as a resting state."
@@ -791,6 +797,7 @@ Panel {
 
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: root.winlockMode === "unlock"
                 ? "Unlock mode fights accidental Fn+Super: toast, then SetFeature unlock. Service: "
@@ -807,6 +814,7 @@ Panel {
           // Where this comes from: omarchy-asus also fixes the rest of the
           // laptop (kernel, NVIDIA, Omarchy) as a signed pacman repo.
           Text {
+            textFormat: Text.PlainText
             visible: root.tab === 0
             width: parent.width
             horizontalAlignment: Text.AlignRight
@@ -844,6 +852,7 @@ Panel {
     implicitHeight: Math.max(rowLabel.implicitHeight, group.implicitHeight)
 
     Text {
+      textFormat: Text.PlainText
       id: rowLabel
       anchors.left: parent.left
       anchors.verticalCenter: parent.verticalCenter

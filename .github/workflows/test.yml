@@ -23,4 +23,4 @@ jobs:
       - name: Slash cursor
         run: node tests/cursor.test.js
       - name: Manifest
-        run: python3 -c "import json; m = json.load(open('manifest.json')); assert m['id'] == 'io.github.omarchy-asus.plugin' and m['entryPoints']"
+        run: python3 -c "import json; m = json.load(open('manifest.json')); assert m['id'] == 'io.github.omarchy-asus.panel' and m['entryPoints']"

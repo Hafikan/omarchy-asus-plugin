@@ -22,7 +22,7 @@ Written and tested on the ASUS ROG Zephyrus G16 (GA605). Everything goes through
 omarchy-plugin-add https://github.com/omarchy-asus/omarchy-asus-plugin --enable
 ```
 
-Update with `omarchy-plugin-update io.github.omarchy-asus.plugin`; the shell reloads it by itself.
+Update with `omarchy-plugin-update io.github.omarchy-asus.panel`; the shell reloads it by itself.
 
 **Needs:** stock Omarchy (Python and PyGObject are already there). Optional:
 - `asusd` (`asusctl`): the keyboard, Slash, charge limit and power limits. Without it those sections hide.
@@ -31,8 +31,8 @@ Update with `omarchy-plugin-update io.github.omarchy-asus.plugin`; the shell rel
 ## Remove
 
 ```bash
-python3 ~/.config/omarchy/plugins/io.github.omarchy-asus.plugin/bridge/asus_bridge.py release   # only if you set power limits
-omarchy-plugin-remove io.github.omarchy-asus.plugin
+/usr/bin/python3 -I ~/.config/omarchy/plugins/io.github.omarchy-asus.panel/bridge/asus_bridge.py release   # only if you set power limits
+omarchy-plugin-remove io.github.omarchy-asus.panel
 ```
 
 `release` turns off the fan curves and asusd PPT tuning groups the plugin turned on for power limits, so no limit outlives it. The plugin leaves your settings in place; delete them if you want a clean slate:
@@ -50,9 +50,9 @@ omarchy-plugin-remove io.github.omarchy-asus.plugin
 - **D-Bus (session bus):** the systemd user manager, to reload, enable and restart `g16-winlock.service` when you change the Fn+Super mode.
 - **Hyprland's IPC sockets:** the monitor list, `hl.monitor()` for the internal panel's refresh rate, and hotplug/reload events.
 - **Files:** it reads and writes only `~/.config/omarchy/power-tune.conf`, `~/.local/state/omarchy/` and the Win-lock drop-in above.
-  - Directories are opened without following symbolic links and must be yours.
+  - Directories are walked from `/` one component at a time without following symbolic links; each must be yours or a root-owned system directory.
   - Writes go to a new private temporary file that is atomically renamed into place.
-  - A symbolic link is never written through (your settings file may be a link to your dotfiles: it's read, and the plugin tells you instead of replacing it).
+  - A symbolic link is never read or written through: keep a real `power-tune.conf` (copy it from your dotfiles), and the log says so if it is a link.
 - **Nothing runs as root,** and the plugin installs nothing system-wide.
 
 ## Per power source: keyboard, refresh rate, panel overdrive
@@ -98,8 +98,8 @@ refresh pin (the panel's 60/240/Auto switch, stored in
 (`power-tune-gaming`), which wins over the power source. For a key binding:
 
 ```bash
-python3 ~/.config/omarchy/plugins/io.github.omarchy-asus.plugin/bridge/asus_bridge.py gaming toggle
-python3 ~/.config/omarchy/plugins/io.github.omarchy-asus.plugin/bridge/asus_bridge.py hz 60   # or: hz auto
+/usr/bin/python3 -I ~/.config/omarchy/plugins/io.github.omarchy-asus.panel/bridge/asus_bridge.py gaming toggle
+/usr/bin/python3 -I ~/.config/omarchy/plugins/io.github.omarchy-asus.panel/bridge/asus_bridge.py hz 60   # or: hz auto
 ```
 
 A monitor hotplug or `hyprctl reload` re-applies `monitors.lua`, which puts the

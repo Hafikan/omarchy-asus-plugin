@@ -624,7 +624,7 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(open(h.victim).read(), "precious\n")
         self.assertTrue(os.path.islink(os.path.join(h.state_dir, "power-tune-hz")))
 
-    def test_a_linked_settings_file_is_read_but_never_written_through(self):
+    def test_a_linked_settings_file_is_neither_read_nor_written_through(self):
         def link(h):
             os.makedirs(os.path.dirname(h.conf))
             h.real_conf = os.path.join(h.tmp, "dotfiles-power-tune.conf")
@@ -632,8 +632,8 @@ class BridgeTest(unittest.TestCase):
                 f.write(CONF)
             os.symlink(h.real_conf, h.conf)
         h = self.harness(conf=None, before=link)
-        h.wait(lambda: h.state.get("refreshHz") == 240, what="settings read through the link")
-        self.assertEqual(h.state["kbdAC"], "med")
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        self.assertNotEqual(h.state.get("kbdAC"), "med", "nothing read through the link")
         r = h.send("kbd-level", "ac", "high")
         self.assertFalse(r["ok"])
         self.assertIn("symbolic link", r["error"])
@@ -650,6 +650,19 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: h.state.get("hasAura"), what="started")
         self.assertFalse(h.send("refresh", "120")["ok"])
         self.assertEqual(os.listdir(h.elsewhere), [], "nothing written through the linked dir")
+
+    def test_a_linked_ancestor_of_the_state_dir_is_refused(self):
+        def plant(h):
+            h.elsewhere = os.path.join(h.tmp, "elsewhere")
+            os.makedirs(os.path.join(h.elsewhere, "state", "omarchy"))
+            local = os.path.dirname(os.path.dirname(h.state_dir))
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+            os.symlink(h.elsewhere, local)
+        h = self.harness(before=plant)
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        self.assertFalse(h.send("refresh", "120")["ok"])
+        self.assertEqual(os.listdir(os.path.join(h.elsewhere, "state", "omarchy")), [],
+                         "nothing written below the linked ancestor")
 
     def test_writes_leave_no_temp_files(self):
         h = self.harness()

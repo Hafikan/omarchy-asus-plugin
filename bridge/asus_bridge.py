@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Persistent bridge for the omarchy-asus plugin (io.github.omarchy-asus.plugin).
+"""Persistent bridge for the omarchy-asus plugin (io.github.omarchy-asus.panel).
 
 Launched by Service.qml as `/usr/bin/python3 -I -B <this file>` with a closed
 environment. It speaks line-delimited JSON on stdin/stdout: commands in
@@ -71,6 +71,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import errno  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
@@ -162,19 +163,20 @@ def log(msg):
 # ------------------------------------------------------------------ safe files
 # Every file this bridge writes is in the user's own XDG config or state dir.
 # A planted symbolic link must never redirect a write:
-#   - the base dir (the XDG config or state home) is resolved once and opened
-#     as a descriptor that must be owned by us;
+#   - the base dir (the XDG config or state home) is walked from / one
+#     component at a time with O_NOFOLLOW: a symbolic link anywhere on the way
+#     is refused, and each step must be ours or a root-owned system dir;
 #   - each dir below it is opened (or created) relative to that descriptor
 #     with O_NOFOLLOW, and must be owned by us too;
 #   - a write goes to a new private temporary file (O_CREAT|O_EXCL|O_NOFOLLOW,
 #     random name) in that dir, is fsynced and renamed over the target; a
 #     target that is a symbolic link is refused, not followed;
-#   - reads are descriptor-checked (a regular file of ours) and size-capped.
-# The settings file alone may be a symbolic link for reading (people keep
-# dotfiles that way); writing it then fails with a message instead.
+#   - reads are opened with O_NOFOLLOW, descriptor-checked (a regular file of
+#     ours) and size-capped; a symbolic link is not read, and says so.
 UID = os.getuid()
 O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 MAX_FILE = 64 * 1024
+MAX_LINE = 60 * 1024
 
 
 class UnsafePath(OSError):
@@ -192,10 +194,37 @@ class Dir:
     """A verified directory descriptor: base/parts..., created if missing."""
 
     def __init__(self, base, parts, create=True):
-        if create and not os.path.exists(base):
-            os.makedirs(base, mode=0o700, exist_ok=True)
-        fd = os.open(os.path.realpath(base), O_DIR)
+        # The base ($HOME, $XDG_*) is walked from / one component at a time,
+        # never through a symbolic link: each step must be this user's, or
+        # root's and not writable by others (sticky dirs such as /tmp aside).
+        # Missing steps are created only inside a directory of ours.
+        if not os.path.isabs(base):
+            raise UnsafePath(f"{base} is not an absolute path")
+        fd = os.open("/", O_DIR)
         try:
+            mine = False
+            for part in base.split("/"):
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    raise UnsafePath(f"{base} contains '..'")
+                if create and mine:
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                try:
+                    nfd = os.open(part, O_DIR, dir_fd=fd)
+                except OSError as e:
+                    if e.errno == errno.ELOOP:
+                        raise UnsafePath(f"{base}: {part} is a symbolic link") from None
+                    raise
+                os.close(fd)
+                fd = nfd
+                st = os.fstat(fd)
+                mine = st.st_uid == UID
+                if not mine and (st.st_uid != 0 or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX)):
+                    raise UnsafePath(f"{base}: {part} is neither ours nor a safe system directory")
             _check_owner(fd, base)
             for part in parts:
                 if create:
@@ -218,13 +247,15 @@ class Dir:
     def __exit__(self, *_):
         os.close(self.fd)
 
-    def read(self, name, follow=False):
-        """The file's text, or None if it's missing, not a regular file of
-        ours, or larger than MAX_FILE."""
-        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | (0 if follow else os.O_NOFOLLOW)
+    def read(self, name):
+        """The file's text, or None if it's missing, a symbolic link, not a
+        regular file of ours, or larger than MAX_FILE."""
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
         try:
             fd = os.open(name, flags, dir_fd=self.fd)
-        except OSError:
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                log(f"{name} is a symbolic link; not read (put the file itself there)")
             return None
         try:
             st = os.fstat(fd)
@@ -247,8 +278,8 @@ class Dir:
     def write(self, name, text, mode=0o600):
         try:
             st = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
-            if not stat.S_ISREG(st.st_mode):
-                raise UnsafePath(f"{name} is a symbolic link or not a regular file; not replacing it")
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != UID:
+                raise UnsafePath(f"{name} is a symbolic link or not a regular file of ours; not replacing it")
             mode = stat.S_IMODE(st.st_mode)
         except FileNotFoundError:
             pass
@@ -263,6 +294,7 @@ class Dir:
             os.close(fd)
             fd = -1
             os.replace(tmp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            os.fsync(self.fd)
         except BaseException:
             if fd >= 0:
                 os.close(fd)
@@ -324,7 +356,7 @@ def read_conf():
     out = {}
     try:
         with config_dir(create=False) as d:
-            text = d.read(CONF_NAME, follow=True) or ""
+            text = d.read(CONF_NAME) or ""
     except OSError:
         return out
     for line in text.splitlines():
@@ -341,7 +373,7 @@ def write_conf_key(key, value):
     if key not in CONF_KEYS or not re.fullmatch(r"[A-Za-z0-9_.:\- ]{0,64}", value):
         raise ValueError(f"bad conf value for {key}")
     with config_dir() as d:
-        text = d.read(CONF_NAME, follow=True)
+        text = d.read(CONF_NAME)
         if text is None and d.is_file(CONF_NAME):
             raise OSError("the settings file can't be read")
         lines = text.splitlines() if text is not None else [
@@ -570,7 +602,13 @@ class Bridge:
 
     # ---- output ----
     def send(self, obj):
-        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        # Bounded here, at the producer: the shell never gets a line over
+        # MAX_LINE (it drops longer ones too).
+        line = json.dumps(obj, separators=(",", ":"))
+        if len(line) > MAX_LINE:
+            log(f"a {obj.get('type', '?')} message is over {MAX_LINE} bytes; not sent")
+            return
+        sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
     def state(self):
@@ -1432,7 +1470,16 @@ def cli(argv):
     return 0
 
 
-if __name__ == "__main__":
+def main():
     if len(sys.argv) > 1:
-        sys.exit(cli(sys.argv[1:]))
-    Bridge().run()
+        return cli(sys.argv[1:])
+    try:
+        Bridge().run()
+    except Exception as e:  # one bounded line, not a traceback
+        log(f"bridge stopped: {type(e).__name__}: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

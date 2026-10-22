@@ -2,7 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Shared state for the omarchy-asus plugin (io.github.omarchy-asus.plugin). The shell mounts
+// Shared state for the omarchy-asus plugin (io.github.omarchy-asus.panel). The shell mounts
 // this once (manifest kind "service"); every bar's widget reads it, so two
 // monitors still mean one bridge.
 //
