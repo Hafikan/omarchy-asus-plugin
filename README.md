@@ -106,10 +106,9 @@ A monitor hotplug or `hyprctl reload` re-applies `monitors.lua`, which puts the
 panel back on its native rate; the widget sets the rate again after both.
 
 **Coming from `omarchy-power-tune`:** the settings file and state files are the
-same, so nothing needs converting. Stop the old service so two programs don't
-set the same things: `systemctl --user disable --now power-tune.service`. Its
-overdrive and refresh jobs are covered here; anything else you added to it is
-not.
+same, so nothing needs converting. Disable the old `power-tune` user service
+so two programs don't set the same things. Its overdrive and refresh jobs are
+covered here; anything else you added to it is not.
 
 The widget also works without asusd: the keyboard and Slash tabs hide, and the
 refresh rate, charge limit and Fn+Super switch stay.
