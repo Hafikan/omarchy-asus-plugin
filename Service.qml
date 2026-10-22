@@ -2,12 +2,12 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Shared state for the G16 Control widget (omarchy-asus.g16). The shell mounts
+// Shared state for the omarchy-asus plugin (io.github.omarchy-asus.plugin). The shell mounts
 // this once (manifest kind "service"); every bar's widget reads it, so two
 // monitors still mean one bridge.
 //
 // Everything that touches the machine lives in one Python process,
-// bridge/g16_bridge.py (standard library plus PyGObject's Gio, both on stock
+// bridge/asus_bridge.py (standard library plus PyGObject's Gio, both on stock
 // Omarchy). It follows asusd, UPower, Hyprland and the settings files by
 // their own events and pushes a JSON "state" line whenever something
 // changes; commands go to it as JSON lines on stdin. It also applies the
@@ -27,7 +27,7 @@ Item {
 
   // ---- injectable for headless tests ----
   property string python3Bin: "/usr/bin/python3"
-  property string bridgePath: decodeURIComponent(Qt.resolvedUrl("bridge/g16_bridge.py").toString().replace(/^file:\/\//, ""))
+  property string bridgePath: decodeURIComponent(Qt.resolvedUrl("bridge/asus_bridge.py").toString().replace(/^file:\/\//, ""))
   // Extra environment for the bridge (tests point it at fake buses and files).
   property var extraEnv: ({})
 
@@ -234,7 +234,7 @@ Item {
     clearEnvironment: true
     stdinEnabled: true
     stdout: SplitParser { onRead: function(line) { svc.handleLine(line) } }
-    // Its log lines ("g16-bridge: ...") go to the shell's log, so they reach
+    // Its log lines ("omarchy-asus: ...") go to the shell's log, so they reach
     // the journal with the rest of the shell's output.
     stderr: SplitParser { onRead: function(line) { console.log(line.slice(0, 500)) } }
     onRunningChanged: if (running) svc._startedAt = Date.now()

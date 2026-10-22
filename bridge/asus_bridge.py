@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Persistent bridge for the G16 Control widget (omarchy-asus.g16).
+"""Persistent bridge for the omarchy-asus plugin (io.github.omarchy-asus.plugin).
 
 Launched by Service.qml as `/usr/bin/python3 -I -B <this file>` with a closed
 environment. It speaks line-delimited JSON on stdin/stdout: commands in
@@ -61,8 +61,8 @@ refresh pin (~/.local/state/omarchy/power-tune-hz, an integer) wins over
 gaming mode (power-tune-gaming exists), which wins over the power source.
 
 Only the Python standard library and PyGObject's Gio/GLib are used. Nothing
-here spawns a process or uses a shell. `g16_bridge.py gaming on|off|toggle`
-and `g16_bridge.py hz <N>|auto` only write the state files and exit; the
+here spawns a process or uses a shell. `asus_bridge.py gaming on|off|toggle`
+and `asus_bridge.py hz <N>|auto` only write the state files and exit; the
 running bridge sees the change and applies it.
 """
 from __future__ import annotations
@@ -74,8 +74,10 @@ sys.dont_write_bytecode = True
 import json  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
+import secrets  # noqa: E402
 import signal  # noqa: E402
 import socket  # noqa: E402
+import stat  # noqa: E402
 
 # Local files and inotify only: never start gvfs (a session-bus daemon) for
 # the file watches below.
@@ -111,6 +113,8 @@ OVERDRIVE_NAME = "panel_overdrive"
 WINLOCK_BIN = "/usr/bin/g16-winlock"
 WINLOCK_UNIT = "g16-winlock.service"
 MAX_LINE = 4096
+HYPR_MAX = 1024 * 1024
+UNIT_STATES = {"active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance"}
 CONF_KEYS = {"PPT_AC", "PPT_USBC", "PPT_WEAK_BARREL", "BOOST_AC", "BOOST_USBC",
              "BOOST_WEAK_BARREL", "KBD_AC", "KBD_BATTERY", "HZ_AC", "HZ_BATTERY", "HZ_GAMING",
              "PANEL_OVERDRIVE_AC", "PANEL_OVERDRIVE_BATTERY", "INTERNAL_OUTPUT",
@@ -132,109 +136,266 @@ def env(name, default=""):
 HOME = env("HOME", "/")
 CONFIG_HOME = env("XDG_CONFIG_HOME", os.path.join(HOME, ".config"))
 STATE_HOME = env("XDG_STATE_HOME", os.path.join(HOME, ".local", "state"))
-CONF_PATH = os.path.join(CONFIG_HOME, "omarchy", "power-tune.conf")
+CONF_NAME = "power-tune.conf"
+CONF_PATH = os.path.join(CONFIG_HOME, "omarchy", CONF_NAME)
 STATE_DIR = os.path.join(STATE_HOME, "omarchy")
-HZ_PIN = os.path.join(STATE_DIR, "power-tune-hz")
-GAMING_FLAG = os.path.join(STATE_DIR, "power-tune-gaming")
+PIN_NAME, GAMING_NAME = "power-tune-hz", "power-tune-gaming"
+HZ_PIN = os.path.join(STATE_DIR, PIN_NAME)
+GAMING_FLAG = os.path.join(STATE_DIR, GAMING_NAME)
 WINLOCK_DROPIN = os.path.join(CONFIG_HOME, "systemd", "user", WINLOCK_UNIT + ".d")
 WINLOCK_MODE_CONF = os.path.join(WINLOCK_DROPIN, "mode.conf")
 # power-tune's edge-trigger state: the source class last applied, and the
 # barrel backlight level saved when leaving it.
-SEEN_SOURCE = os.path.join(STATE_DIR, "power-tune.source")
-SAVED_BRIGHT = os.path.join(STATE_DIR, "power-tune.bright-ac")
-CURVES_STATE = os.path.join(STATE_DIR, "g16-ppt-curves")
-GROUPS_STATE = os.path.join(STATE_DIR, "g16-ppt-groups")
+SEEN_NAME, SAVED_NAME = "power-tune.source", "power-tune.bright-ac"
+CURVES_NAME, GROUPS_NAME = "g16-ppt-curves", "g16-ppt-groups"
 # Tests point these at a temp tree; on a real system they are the defaults.
 SYSROOT = env("G16_BRIDGE_SYSROOT", "/sys")
 WINLOCK_PATH = env("G16_BRIDGE_WINLOCK", WINLOCK_BIN)
 
 
 def log(msg):
-    print(f"g16-bridge: {msg}", file=sys.stderr, flush=True)
+    # Bounded and printable: the shell forwards these lines to its journal.
+    text = re.sub(r"[^\x20-\x7e]", "?", str(msg))[:300]
+    print(f"omarchy-asus: {text}", file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ safe files
+# Every file this bridge writes is in the user's own XDG config or state dir.
+# A planted symbolic link must never redirect a write:
+#   - the base dir (the XDG config or state home) is resolved once and opened
+#     as a descriptor that must be owned by us;
+#   - each dir below it is opened (or created) relative to that descriptor
+#     with O_NOFOLLOW, and must be owned by us too;
+#   - a write goes to a new private temporary file (O_CREAT|O_EXCL|O_NOFOLLOW,
+#     random name) in that dir, is fsynced and renamed over the target; a
+#     target that is a symbolic link is refused, not followed;
+#   - reads are descriptor-checked (a regular file of ours) and size-capped.
+# The settings file alone may be a symbolic link for reading (people keep
+# dotfiles that way); writing it then fails with a message instead.
+UID = os.getuid()
+O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+MAX_FILE = 64 * 1024
+
+
+class UnsafePath(OSError):
+    pass
+
+
+def _check_owner(fd, what):
+    st = os.fstat(fd)
+    if st.st_uid != UID:
+        raise UnsafePath(f"{what} is not owned by this user")
+    return st
+
+
+class Dir:
+    """A verified directory descriptor: base/parts..., created if missing."""
+
+    def __init__(self, base, parts, create=True):
+        if create and not os.path.exists(base):
+            os.makedirs(base, mode=0o700, exist_ok=True)
+        fd = os.open(os.path.realpath(base), O_DIR)
+        try:
+            _check_owner(fd, base)
+            for part in parts:
+                if create:
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                nfd = os.open(part, O_DIR, dir_fd=fd)
+                os.close(fd)
+                fd = nfd
+                _check_owner(fd, part)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        os.close(self.fd)
+
+    def read(self, name, follow=False):
+        """The file's text, or None if it's missing, not a regular file of
+        ours, or larger than MAX_FILE."""
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | (0 if follow else os.O_NOFOLLOW)
+        try:
+            fd = os.open(name, flags, dir_fd=self.fd)
+        except OSError:
+            return None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != UID:
+                return None
+            data = os.read(fd, MAX_FILE + 1)
+            if len(data) > MAX_FILE:
+                log(f"{name} is larger than {MAX_FILE} bytes; ignored")
+                return None
+            return data.decode("utf-8", errors="replace")
+        finally:
+            os.close(fd)
+
+    def is_file(self, name):
+        try:
+            return stat.S_ISREG(os.stat(name, dir_fd=self.fd, follow_symlinks=False).st_mode)
+        except OSError:
+            return False
+
+    def write(self, name, text, mode=0o600):
+        try:
+            st = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            if not stat.S_ISREG(st.st_mode):
+                raise UnsafePath(f"{name} is a symbolic link or not a regular file; not replacing it")
+            mode = stat.S_IMODE(st.st_mode)
+        except FileNotFoundError:
+            pass
+        tmp = f".{name}.{secrets.token_hex(6)}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     mode, dir_fd=self.fd)
+        try:
+            data = text.encode("utf-8")
+            while data:
+                data = data[os.write(fd, data):]
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.replace(tmp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp, dir_fd=self.fd)
+            except OSError:
+                pass
+            raise
+
+    def remove(self, name):
+        try:
+            os.unlink(name, dir_fd=self.fd)
+        except FileNotFoundError:
+            pass
+
+
+def config_dir(*parts, create=True):
+    return Dir(CONFIG_HOME, ["omarchy", *parts], create)
+
+
+def state_dir(create=True):
+    return Dir(STATE_HOME, ["omarchy"], create)
+
+
+def dropin_dir(create=True):
+    return Dir(CONFIG_HOME, ["systemd", "user", WINLOCK_UNIT + ".d"], create)
+
+
+def state_read(name):
+    try:
+        with state_dir(create=False) as d:
+            return (d.read(name) or "").strip()
+    except OSError:
+        return ""
+
+
+def state_write(name, text):
+    with state_dir() as d:
+        d.write(name, text + "\n")
+
+
+def state_remove(name):
+    try:
+        with state_dir(create=False) as d:
+            d.remove(name)
+    except OSError:
+        pass
+
+
+def state_int(name):
+    v = re.sub(r"[^0-9]", "", state_read(name))[:6]
+    return int(v) if v else None
 
 
 # ------------------------------------------------------------------ files
-def read_conf(path=CONF_PATH):
-    """KEY=VALUE lines; quotes stripped; anything else ignored (never sourced)."""
+def read_conf():
+    """KEY=VALUE lines; quotes stripped; anything else ignored (never sourced).
+    Values are short tokens: anything longer than 64 characters is dropped."""
     out = {}
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                m = re.match(r"^\s*([A-Z_]+)=([\"']?)(.*?)\2\s*(?:#.*)?$", line)
-                if m and m.group(1) in CONF_KEYS:
-                    out[m.group(1)] = m.group(3).strip()
+        with config_dir(create=False) as d:
+            text = d.read(CONF_NAME, follow=True) or ""
     except OSError:
-        pass
+        return out
+    for line in text.splitlines():
+        if len(line) > 512:
+            continue
+        m = re.match(r"^\s*([A-Z_]+)=([\"']?)(.*?)\2\s*(?:#.*)?$", line)
+        if m and m.group(1) in CONF_KEYS and len(m.group(3)) <= 64:
+            out[m.group(1)] = m.group(3).strip()
     return out
 
 
-def write_conf_key(key, value, path=CONF_PATH):
+def write_conf_key(key, value):
     """Rewrite KEY in place, or append it; other lines are kept as they are."""
-    if key not in CONF_KEYS or not re.fullmatch(r"[A-Za-z0-9_.:\- ]*", value):
+    if key not in CONF_KEYS or not re.fullmatch(r"[A-Za-z0-9_.:\- ]{0,64}", value):
         raise ValueError(f"bad conf value for {key}")
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except FileNotFoundError:
-        lines = ["# Per power source settings for the G16 Control widget (and the",
-                 "# omarchy-power-tune keys it replaces). A missing key is left alone."]
-    done = False
-    for i, line in enumerate(lines):
-        if re.match(rf"^\s*{key}=", line):
-            lines[i] = f"{key}={value}"
-            done = True
-    if not done:
-        lines.append(f"{key}={value}")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".g16-bridge.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    os.replace(tmp, path)
+    with config_dir() as d:
+        text = d.read(CONF_NAME, follow=True)
+        if text is None and d.is_file(CONF_NAME):
+            raise OSError("the settings file can't be read")
+        lines = text.splitlines() if text is not None else [
+            "# Per power source settings for the omarchy-asus plugin (and the",
+            "# omarchy-power-tune keys it replaces). A missing key is left alone."]
+        done = False
+        for i, line in enumerate(lines):
+            if re.match(rf"^\s*{key}=", line):
+                lines[i] = f"{key}={value}"
+                done = True
+        if not done:
+            lines.append(f"{key}={value}")
+        d.write(CONF_NAME, "\n".join(lines) + "\n", mode=0o644)
 
 
 def read_int_file(path):
+    """A small integer from a kernel (sysfs) attribute."""
     try:
         with open(path, encoding="ascii", errors="replace") as f:
-            v = re.sub(r"[^0-9]", "", f.read())
+            v = re.sub(r"[^0-9]", "", f.read(32))[:9]
         return int(v) if v else None
     except OSError:
         return None
 
 
 def pinned_hz():
-    return read_int_file(HZ_PIN)
+    return state_int(PIN_NAME)
 
 
 def gaming_on():
-    return os.path.exists(GAMING_FLAG)
+    try:
+        with state_dir(create=False) as d:
+            return d.is_file(GAMING_NAME)
+    except OSError:
+        return False
 
 
 def set_pin(value):
-    os.makedirs(STATE_DIR, exist_ok=True)
     if value == "auto":
-        try:
-            os.unlink(HZ_PIN)
-        except FileNotFoundError:
-            pass
+        state_remove(PIN_NAME)
     elif re.fullmatch(r"[0-9]{2,3}", value):
-        with open(HZ_PIN, "w", encoding="ascii") as f:
-            f.write(value + "\n")
+        state_write(PIN_NAME, value)
     else:
         raise ValueError(f"bad refresh value: {value}")
 
 
 def set_gaming(value):
-    os.makedirs(STATE_DIR, exist_ok=True)
     on = {"on": True, "off": False, "toggle": not gaming_on()}.get(value)
     if on is None:
         raise ValueError(f"bad gaming value: {value}")
     if on:
-        open(GAMING_FLAG, "a").close()
+        state_write(GAMING_NAME, "on")
     else:
-        try:
-            os.unlink(GAMING_FLAG)
-        except FileNotFoundError:
-            pass
+        state_remove(GAMING_NAME)
 
 
 def charge_limit_sysfs():
@@ -260,7 +421,7 @@ def charge_mode():
 def backlight_device(conf):
     want = conf.get("BRIGHT_DEVICE", "")
     base = os.path.join(SYSROOT, "class", "backlight")
-    if want and re.fullmatch(r"[A-Za-z0-9_.:-]+", want):
+    if want and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", want):
         return want
     try:
         for n in sorted(os.listdir(base)):
@@ -271,25 +432,11 @@ def backlight_device(conf):
     return ""
 
 
-def read_text(path):
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read().strip()
-    except OSError:
-        return ""
-
-
-def write_text(path, text):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text + "\n")
-
-
 def winlock_mode():
     m = "toast"
     try:
-        with open(WINLOCK_MODE_CONF, encoding="utf-8", errors="replace") as f:
-            for line in f:
+        with dropin_dir(create=False) as d:
+            for line in (d.read("mode.conf") or "").splitlines():
                 if line.startswith("Environment=G16_WINLOCK_MODE="):
                     m = line.split("=", 2)[2].strip().strip('"')
     except OSError:
@@ -320,11 +467,14 @@ class Hyprland:
         try:
             s.connect(os.path.join(self.dir, ".socket.sock"))
             s.sendall(cmd.encode())
-            chunks = []
+            chunks, size = [], 0
             while True:
                 d = s.recv(65536)
                 if not d:
                     break
+                size += len(d)
+                if size > HYPR_MAX:
+                    raise OSError(f"Hyprland's reply to {cmd.split()[0]} is over {HYPR_MAX} bytes")
                 chunks.append(d)
             return b"".join(chunks).decode(errors="replace")
         finally:
@@ -334,7 +484,10 @@ class Hyprland:
         try:
             data = json.loads(self.request("j/monitors"))
             return data if isinstance(data, list) else []
-        except (OSError, ValueError):
+        except OSError as e:
+            log(f"Hyprland monitors: {e}")
+            return []
+        except ValueError:
             return []
 
     def listen(self):
@@ -446,7 +599,8 @@ class Bridge:
             "hasAura": bool(self.aura),
             "kbdBrightness": max(0, min(3, int(bright))) if isinstance(bright, int) else 0,
             "kbdColor": color,
-            "kbdAC": self.conf.get("KBD_AC", ""), "kbdBattery": self.conf.get("KBD_BATTERY", ""),
+            # Only values the panel knows; anything else from the file is "not set".
+            "kbdAC": self.level_conf("KBD_AC"), "kbdBattery": self.level_conf("KBD_BATTERY"),
             "kbdBoot": flags[0], "kbdAwake": flags[1], "kbdSleep": flags[2], "kbdShutdown": flags[3],
             "hasSlash": bool(self.slash),
             "slashOn": bool(slash.get("Enabled", False)),
@@ -466,6 +620,10 @@ class Bridge:
         for f in SLASH_FLAGS:
             s[f[0].lower() + f[1:]] = bool(slash.get(f, False))
         return s
+
+    def level_conf(self, key):
+        v = self.conf.get(key, "").lower()
+        return v if v in LEVELS else ""
 
     def emit(self):
         if self.emit_pending:
@@ -760,7 +918,7 @@ class Bridge:
 
     def read_curves(self):
         try:
-            return [int(x) for x in read_text(CURVES_STATE).split() if x.isdigit()]
+            return [int(x) for x in state_read(CURVES_NAME).split()[:8] if x.isdigit()]
         except ValueError:
             return []
 
@@ -777,7 +935,7 @@ class Bridge:
                       GLib.Variant("(ub)", (profile, on)))
         had = self.read_curves()
         now = sorted(set(had) | {profile}) if on else [p for p in had if p != profile]
-        write_text(CURVES_STATE, " ".join(str(p) for p in now))
+        state_write(CURVES_NAME, " ".join(str(p) for p in now))
 
     def write_attr(self, name, value, default=False):
         """Write an asus-armoury attribute through asusd, clamped to its live
@@ -809,14 +967,14 @@ class Bridge:
 
     def read_groups(self):
         out = []
-        for line in read_text(GROUPS_STATE).splitlines():
+        for line in state_read(GROUPS_NAME).splitlines()[:16]:
             parts = line.split()
             if len(parts) == 2 and parts[0] in ("ac", "dc") and parts[1].isdigit():
                 out.append((parts[0], int(parts[1])))
         return out
 
     def write_groups(self, groups):
-        write_text(GROUPS_STATE, "\n".join(f"{p} {n}" for p, n in sorted(set(groups))))
+        state_write(GROUPS_NAME, "\n".join(f"{p} {n}" for p, n in sorted(set(groups))))
 
     def power_state(self):
         # asusd keys its tuning groups on the AC adapter (USB-C counts).
@@ -882,11 +1040,11 @@ class Bridge:
         the saved level returns unless it has since gone brighter. The first
         apply after a start only records the class."""
         cls = "ac" if self.kind in ("ac", "weak") else "battery"
-        prev = read_text(SEEN_SOURCE)
+        prev = state_read(SEEN_NAME)
         if prev == cls:
             return
         try:
-            write_text(SEEN_SOURCE, cls)
+            state_write(SEEN_NAME, cls)
         except OSError as e:
             log(f"cannot record the power source: {e}")
         pct = self.conf.get("BRIGHT_BATTERY", "")
@@ -900,14 +1058,11 @@ class Bridge:
             return
         if prev == "ac" and cls != "ac":
             if cur * 100 // top > int(pct):
-                write_text(SAVED_BRIGHT, str(cur))
+                state_write(SAVED_NAME, str(cur))
                 self.set_backlight(dev, top * int(pct) // 100)
         elif prev != "ac" and cls == "ac":
-            want = read_int_file(SAVED_BRIGHT)
-            try:
-                os.unlink(SAVED_BRIGHT)
-            except FileNotFoundError:
-                pass
+            want = state_int(SAVED_NAME)
+            state_remove(SAVED_NAME)
             if want is not None and cur < want:
                 self.set_backlight(dev, want)
 
@@ -1019,11 +1174,12 @@ class Bridge:
         self.monitors_ = []
         # GLib re-checks a watched file whose directory is missing every 4 s;
         # with the directories in place the watches are plain inotify.
-        for d in {os.path.dirname(p) for p in (CONF_PATH, HZ_PIN, WINLOCK_MODE_CONF)}:
+        for opener in (config_dir, state_dir, dropin_dir):
             try:
-                os.makedirs(d, exist_ok=True)
+                with opener():
+                    pass
             except OSError as e:
-                log(f"cannot create {d}: {e}")
+                log(f"cannot prepare a settings dir: {e}")
         for path in (CONF_PATH, HZ_PIN, GAMING_FLAG, WINLOCK_MODE_CONF):
             mon = Gio.File.new_for_path(path).monitor_file(Gio.FileMonitorFlags.WATCH_MOVES, None)
             mon.connect("changed", self.file_changed)
@@ -1064,16 +1220,16 @@ class Bridge:
                              "(o)", 1000).unpack()[0]
             v = self.call(self.session, SYSTEMD, path, PROPS, "Get",
                           GLib.Variant("(ss)", (SYSTEMD + ".Unit", "ActiveState")), "(v)", 1000)
-            return str(v.unpack()[0])
+            state = str(v.unpack()[0])
+            return state if state in UNIT_STATES else "inactive"
         except GLib.Error:
             return "inactive"
 
     def set_winlock_mode(self, mode):
         if mode not in ("toast", "unlock"):
             raise ValueError(f"bad winlock mode: {mode}")
-        os.makedirs(WINLOCK_DROPIN, exist_ok=True)
-        with open(WINLOCK_MODE_CONF, "w", encoding="utf-8") as f:
-            f.write(f"[Service]\nEnvironment=G16_WINLOCK_MODE={mode}\n")
+        with dropin_dir() as d:
+            d.write("mode.conf", f"[Service]\nEnvironment=G16_WINLOCK_MODE={mode}\n", mode=0o644)
         if not self.session:
             return
         mgr = "/org/freedesktop/systemd1"
@@ -1256,8 +1412,22 @@ def cli(argv):
             set_pin(argv[1])
         pin = pinned_hz()
         print("hz override:", pin if pin else "auto")
+    elif argv[0] == "release":
+        # Before removing the plugin: turn off every fan curve and PPT tuning
+        # group the bridge turned on, so no power limit outlives it.
+        b = Bridge()
+        b.read_on_battery()
+        b.discover()
+        b.conf, b.limits_on = {}, True
+        b.apply_limits("release")
+        left = b.read_groups()
+        if left:
+            print("still on (for another power state or profile; inert while their fan curve is off):",
+                  " ".join(f"{p}/{n}" for p, n in left))
+        else:
+            print("released: no fan curve or PPT tuning group left on")
     else:
-        print("usage: g16_bridge.py [gaming on|off|toggle | hz <N>|auto|get]", file=sys.stderr)
+        print("usage: asus_bridge.py [gaming on|off|toggle | hz <N>|auto|get | release]", file=sys.stderr)
         return 2
     return 0
 

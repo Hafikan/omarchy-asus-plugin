@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""bridge/g16_bridge.py end to end, headless: two private dbus-daemons (one
+"""bridge/asus_bridge.py end to end, headless: two private dbus-daemons (one
 standing in for the system bus) with fake asusd, UPower and systemd
 (tests/fake_services.py), a fake Hyprland on its two IPC sockets, a fake
 sysfs tree and a temp HOME. The real bridge runs as the shell would start it.
@@ -20,7 +20,7 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BRIDGE = os.path.join(HERE, "..", "bridge", "g16_bridge.py")
+BRIDGE = os.path.join(HERE, "..", "bridge", "asus_bridge.py")
 FAKES = os.path.join(HERE, "fake_services.py")
 AURA = "/xyz/ljones/aura/19b6_3_4"
 OVERDRIVE = "/xyz/ljones/asus_armoury/panel_overdrive"
@@ -45,6 +45,7 @@ class FakeHyprland:
         self.dir = d
         os.makedirs(d)
         self.hz = 60
+        self.giant = False      # answer j/monitors with 2 MB (a misbehaving compositor)
         self.evals = []
         self.listeners = []
         self.lock = threading.Lock()
@@ -62,14 +63,19 @@ class FakeHyprland:
                     c, _ = s.accept()
                 except OSError:
                     return
-                handler(c)
+                try:
+                    handler(c)
+                except OSError:
+                    pass        # a client that hangs up mid-reply (the bridge's size cap)
         threading.Thread(target=loop, daemon=True).start()
         return s
 
     def _request(self, c):
         data = c.recv(65536).decode()
         with self.lock:
-            if data == "j/monitors":
+            if data == "j/monitors" and self.giant:
+                out = "[" + " " * (2 * 1024 * 1024) + "]"
+            elif data == "j/monitors":
                 out = json.dumps([
                     {"name": "eDP-1", "description": "Samsung Display Corp. ATNA60DL04-0",
                      "width": 2560, "height": 1600, "x": 0, "y": 0, "scale": 1.6,
@@ -105,7 +111,7 @@ class FakeHyprland:
 
 class Harness:
     def __init__(self, conf=CONF, asusd=True, on_battery=False, charge_mode=None, bright=None,
-                 slash_getall_fails=False, state_files=None):
+                 slash_getall_fails=False, state_files=None, before=None, giant_hyprland=False):
         self.tmp = tempfile.mkdtemp(prefix="g16b-")
         t = self.tmp
         self.home = os.path.join(t, "home")
@@ -142,6 +148,8 @@ class Harness:
             os.makedirs(self.state_dir, exist_ok=True)
             with open(os.path.join(self.state_dir, name), "w") as f:
                 f.write(text)
+        if before:
+            before(self)
         self.winlock = os.path.join(t, "g16-winlock")
         with open(self.winlock, "w") as f:
             f.write("#!/bin/sh\n")
@@ -152,6 +160,7 @@ class Harness:
         self.sysbus = self._bus("system.bus")
         self.sesbus = self._bus("session.bus")
         self.hypr = FakeHyprland(os.path.join(self.run_dir, "hypr", "SIG"))
+        self.hypr.giant = giant_hyprland
         base = {"PATH": "/usr/bin:/bin", "HOME": self.home, "LANG": "C.UTF-8",
                 "DBUS_SYSTEM_BUS_ADDRESS": self.sysbus, "DBUS_SESSION_BUS_ADDRESS": self.sesbus}
         fenv = dict(base, FAKE_LOG=self.log, FAKE_NO_ASUSD="0" if asusd else "1", FAKE_SYSFS=self.sys,
@@ -594,6 +603,94 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: h.curve_calls() == [[2, "CPU", False]], what="stale curve off")
         with open(os.path.join(h.state_dir, "g16-ppt-curves")) as f:
             self.assertEqual(f.read().strip(), "")
+
+    # ---- the bridge's own file writes: no symlink ever redirects one ----
+    def test_a_planted_link_at_a_state_file_is_not_followed(self):
+        def plant(h):
+            os.makedirs(h.state_dir)
+            h.victim = os.path.join(h.tmp, "victim")
+            with open(h.victim, "w") as f:
+                f.write("precious\n")
+            os.symlink(h.victim, os.path.join(h.state_dir, "power-tune-hz"))
+            os.symlink(h.victim, os.path.join(h.state_dir, "power-tune-gaming"))
+        h = self.harness(before=plant)
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        self.assertFalse(h.state["gaming"], "a link is not a gaming flag")
+        self.assertEqual(h.state["refreshOverride"], "auto", "a link is not a pin")
+        r = h.send("refresh", "120")
+        self.assertFalse(r["ok"])
+        self.assertIn("symbolic link", r["error"])
+        self.assertFalse(h.send("gaming", "on")["ok"])
+        self.assertEqual(open(h.victim).read(), "precious\n")
+        self.assertTrue(os.path.islink(os.path.join(h.state_dir, "power-tune-hz")))
+
+    def test_a_linked_settings_file_is_read_but_never_written_through(self):
+        def link(h):
+            os.makedirs(os.path.dirname(h.conf))
+            h.real_conf = os.path.join(h.tmp, "dotfiles-power-tune.conf")
+            with open(h.real_conf, "w") as f:
+                f.write(CONF)
+            os.symlink(h.real_conf, h.conf)
+        h = self.harness(conf=None, before=link)
+        h.wait(lambda: h.state.get("refreshHz") == 240, what="settings read through the link")
+        self.assertEqual(h.state["kbdAC"], "med")
+        r = h.send("kbd-level", "ac", "high")
+        self.assertFalse(r["ok"])
+        self.assertIn("symbolic link", r["error"])
+        self.assertEqual(open(h.real_conf).read(), CONF, "the dotfile is untouched")
+        self.assertTrue(os.path.islink(h.conf))
+
+    def test_a_linked_state_dir_is_refused(self):
+        def plant(h):
+            h.elsewhere = os.path.join(h.tmp, "elsewhere")
+            os.makedirs(h.elsewhere)
+            os.makedirs(os.path.dirname(h.state_dir))
+            os.symlink(h.elsewhere, h.state_dir)
+        h = self.harness(before=plant)
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        self.assertFalse(h.send("refresh", "120")["ok"])
+        self.assertEqual(os.listdir(h.elsewhere), [], "nothing written through the linked dir")
+
+    def test_writes_leave_no_temp_files(self):
+        h = self.harness()
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        for args in (("refresh", "120"), ("gaming", "on"), ("kbd-level", "ac", "low"),
+                     ("refresh", "auto"), ("gaming", "off"), ("winlock-mode", "unlock")):
+            self.assertTrue(h.send(*args)["ok"], args)
+        for d in (h.state_dir, os.path.dirname(h.conf)):
+            self.assertEqual([n for n in os.listdir(d) if n.endswith(".tmp")], [], d)
+        self.assertEqual(oct(os.stat(os.path.join(h.state_dir, "power-tune-hz")).st_mode & 0o777)
+                         if os.path.exists(os.path.join(h.state_dir, "power-tune-hz")) else "gone", "gone")
+
+    def test_a_huge_hyprland_reply_is_capped(self):
+        h = self.harness(giant_hyprland=True)
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        self.assertEqual((h.state["refreshHz"], h.state["hasPanel"]), (0, False))
+        h.err.flush()
+        with open(os.path.join(h.tmp, "bridge.err")) as f:
+            self.assertIn("is over 1048576 bytes", f.read(), "refused by the cap, not parsed")
+        h.hypr.giant = False
+        h.send("get")                     # a re-read sees the panel again (at its current 60 Hz)
+        h.wait(lambda: h.state.get("hasPanel") and h.state.get("refreshHz") == 60, what="normal again")
+
+    def test_overlong_settings_values_are_ignored(self):
+        h = self.harness(conf=CONF.replace("KBD_AC=med", "KBD_AC=" + "m" * 1000))
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        self.assertEqual(h.state["kbdAC"], "")
+
+    def test_release_turns_everything_off_before_removal(self):
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
+        h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits")
+        h.bridge.stdin.close()              # the plugin is being removed
+        h.bridge.wait(5)
+        r = subprocess.run([sys.executable, "-I", "-B", BRIDGE, "release"], env=h.env,
+                           capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("released", r.stdout)
+        self.assertEqual(h.curve_calls()[-1:], [[0, "CPU", False]])
+        self.assertEqual(h.group_sets()[-1:], [[False, "plugged", 0]])
+        state = lambda n: open(os.path.join(h.state_dir, n)).read().strip()
+        self.assertEqual((state("g16-ppt-curves"), state("g16-ppt-groups")), ("", ""))
 
     def test_closing_stdin_stops_the_bridge(self):
         h = self.harness()

@@ -1,30 +1,59 @@
-# G16 Control
+# omarchy-asus plugin
 
-An [Omarchy](https://omarchy.org) bar widget for the **ASUS ROG Zephyrus G16 (GA605)**: everything the laptop's hardware can do, in one panel.
+**One panel for your ASUS laptop's hardware, in the [Omarchy](https://omarchy.org) bar.**
 
-> **Part of [omarchy-asus](https://github.com/omarchy-asus/omarchy-asus)**: kernel, NVIDIA and Omarchy fixes for ASUS ROG laptops, as a signed pacman repo. This widget covers the controls; omarchy-asus fixes the rest. That includes the Fn+Super Win-lock keys, the touchpad, sleep with an HDMI monitor, the NVIDIA hibernate hang and USB-C charging profiles. See [what ships](https://github.com/omarchy-asus/omarchy-asus#what-ships) and the [install guide](https://github.com/omarchy-asus/omarchy-asus/blob/main/LAPTOP-SETUP.md).
+> From **[omarchy-asus](https://omarchy-asus.github.io)**: ASUS fixes for Omarchy. A signed pacman repo carries the kernel, NVIDIA and Omarchy fixes that make an ASUS laptop work properly: the Fn+Super Win-lock keys, the touchpad, sleep with an HDMI monitor attached, the NVIDIA hibernate hang, USB-C charging profiles and more. This plugin is the control panel. **→ [omarchy-asus.github.io](https://omarchy-asus.github.io)** · [repository](https://github.com/omarchy-asus/omarchy-asus)
+
+Written and tested on the ASUS ROG Zephyrus G16 (GA605). Everything goes through `asusd` and the kernel's ASUS drivers, and **each section hides when your laptop doesn't have it**, so other ASUS models get what they support. The lid Slash LEDs, for example, appear only on models that have them.
 
 ## What it does
 
 - **Keyboard backlight:** a level for the barrel charger and one for battery / USB-C, applied on every plug and unplug; colour; and the boot/awake/sleep/shutdown lighting.
-- **Lid Slash LEDs:** on/off, brightness, pattern (with keyboard navigation: arrows or h/j/k/l, Enter), and when it shows.
+- **Lid Slash LEDs:** on/off, brightness, pattern (keyboard navigation: arrows or h/j/k/l, then Enter), and when it shows.
 - **Internal panel refresh rate** per power source, a gaming rate, or pinned (60/240/Auto). It's set again after a monitor hotplug or `hyprctl reload`.
 - **Screen backlight:** optionally dimmed on leaving the barrel charger, and restored on return.
-- **CPU power limits per charger** (USB-C, a weak third-party barrel), and panel overdrive per source.
+- **CPU power limits per charger** (a USB-C charger; a weak third-party barrel that keeps dropping out), and panel overdrive per source.
 - **Battery charge limit** (60/80/100 %).
-- **Fn+Super (Win-lock) mode:** toast or auto-unlock, if the omarchy-asus Win-lock helper is installed.
-
-It tells the 220 W barrel, USB-C chargers and a flapping third-party barrel apart, and gives each its own settings.
+- **Fn+Super (Win-lock) mode:** toast or auto-unlock, with the omarchy-asus Win-lock helper.
 
 ## Install
 
 ```bash
-omarchy-plugin-add https://github.com/omarchy-asus/g16-control --enable
+omarchy-plugin-add https://github.com/omarchy-asus/omarchy-asus-plugin --enable
 ```
 
-Updates: `omarchy-plugin-update omarchy-asus.g16`. The shell reloads the widget by itself.
+Update with `omarchy-plugin-update io.github.omarchy-asus.plugin`; the shell reloads it by itself.
 
-**Needs:** stock Omarchy (Python and PyGObject are already there) and `asusd` (`asusctl`) for the keyboard, Slash, charge limit and power limits. Without asusd those sections hide. The Fn+Super switch needs `asus-rog-nkey-winlock` and the Win-lock kernel patch, both from [omarchy-asus](https://github.com/omarchy-asus/omarchy-asus).
+**Needs:** stock Omarchy (Python and PyGObject are already there). Optional:
+- `asusd` (`asusctl`): the keyboard, Slash, charge limit and power limits. Without it those sections hide.
+- the Fn+Super switch: `asus-rog-nkey-winlock` and the Win-lock kernel patch, both from [omarchy-asus](https://omarchy-asus.github.io).
+
+## Remove
+
+```bash
+python3 ~/.config/omarchy/plugins/io.github.omarchy-asus.plugin/bridge/asus_bridge.py release   # only if you set power limits
+omarchy-plugin-remove io.github.omarchy-asus.plugin
+```
+
+`release` turns off the fan curves and asusd PPT tuning groups the plugin turned on for power limits, so no limit outlives it. The plugin leaves your settings in place; delete them if you want a clean slate:
+- `~/.config/omarchy/power-tune.conf`;
+- `~/.local/state/omarchy/power-tune-*`, `g16-ppt-*`;
+- `~/.config/systemd/user/g16-winlock.service.d/mode.conf`, if you changed the Fn+Super mode.
+
+## What it touches
+
+- **One process:** `/usr/bin/python3 -I -B bridge/asus_bridge.py`, started by the shell with a cleared, allow-listed environment. It spawns nothing and uses no network.
+- **D-Bus (system bus):**
+  - `asusd`: reads and sets the keyboard, Slash, charge limit, panel overdrive, PPT attributes, CPU fan-curve enable and the PPT tuning group. The last three only for power-limit keys you set.
+  - `UPower`: read only.
+  - `logind` `SetBrightness`: the screen backlight, only if you set `BRIGHT_BATTERY`.
+- **D-Bus (session bus):** the systemd user manager, to reload, enable and restart `g16-winlock.service` when you change the Fn+Super mode.
+- **Hyprland's IPC sockets:** the monitor list, `hl.monitor()` for the internal panel's refresh rate, and hotplug/reload events.
+- **Files:** it reads and writes only `~/.config/omarchy/power-tune.conf`, `~/.local/state/omarchy/` and the Win-lock drop-in above.
+  - Directories are opened without following symbolic links and must be yours.
+  - Writes go to a new private temporary file that is atomically renamed into place.
+  - A symbolic link is never written through (your settings file may be a link to your dotfiles: it's read, and the plugin tells you instead of replacing it).
+- **Nothing runs as root,** and the plugin installs nothing system-wide.
 
 ## Per power source: keyboard, refresh rate, panel overdrive
 
@@ -69,8 +98,8 @@ refresh pin (the panel's 60/240/Auto switch, stored in
 (`power-tune-gaming`), which wins over the power source. For a key binding:
 
 ```bash
-python3 ~/.config/omarchy/plugins/omarchy-asus.g16/bridge/g16_bridge.py gaming toggle
-python3 ~/.config/omarchy/plugins/omarchy-asus.g16/bridge/g16_bridge.py hz 60   # or: hz auto
+python3 ~/.config/omarchy/plugins/io.github.omarchy-asus.plugin/bridge/asus_bridge.py gaming toggle
+python3 ~/.config/omarchy/plugins/io.github.omarchy-asus.plugin/bridge/asus_bridge.py hz 60   # or: hz auto
 ```
 
 A monitor hotplug or `hyprctl reload` re-applies `monitors.lua`, which puts the
@@ -89,7 +118,7 @@ refresh rate, charge limit and Fn+Super switch stay.
 
 `Service.qml` (manifest kind `service`) holds the widget's state once, however
 many bars show it. Everything that touches the machine is one process,
-`bridge/g16_bridge.py`. It uses only the Python standard library and
+`bridge/asus_bridge.py`. It uses only the Python standard library and
 PyGObject's Gio, both on stock Omarchy, and it spawns nothing. It talks to:
 - asusd and UPower over D-Bus, and follows their `PropertiesChanged` signals;
 - Hyprland over its IPC sockets, including the event socket;
@@ -111,4 +140,4 @@ tests/service.test.sh     # Service.qml headless in quickshell (skips without qs
 
 ## License
 
-MIT. Part of [omarchy-asus](https://github.com/omarchy-asus/omarchy-asus).
+MIT. Part of [omarchy-asus](https://omarchy-asus.github.io).

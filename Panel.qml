@@ -5,7 +5,10 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 
-// One control surface for every LED on this Zephyrus G16 (GA605), which is why
+// The omarchy-asus plugin: one control surface for an ASUS laptop's hardware.
+// Written on the ROG Zephyrus G16 (GA605); every section hides when the laptop
+// (or asusd) doesn't have it, so other ASUS models get what they support.
+// For the LEDs, that's why
 // this widget replaces the older Slash-only one rather than sitting beside it.
 // The machine has exactly two user-controllable lights, and they are reached
 // very differently:
@@ -27,8 +30,8 @@ import qs.Ui
 // `asusctl aura effect` advertises.
 Panel {
   id: root
-  moduleName: "omarchy-asus.g16"
-  ipcTarget: "omarchy-asus.g16"
+  moduleName: "io.github.omarchy-asus.plugin"
+  ipcTarget: "io.github.omarchy-asus.plugin"
 
   // All state and every process live in Service.qml, which the shell mounts
   // once (manifest kind "service"). With one bar per monitor this widget used
@@ -40,7 +43,7 @@ Panel {
   readonly property var svc: {
     var tick = root.serviceTick
     var host = root.bar ? root.bar.shell : null
-    return host && typeof host.serviceFor === "function" ? host.serviceFor("omarchy-asus.g16") : null
+    return host && typeof host.serviceFor === "function" ? host.serviceFor("io.github.omarchy-asus.plugin") : null
   }
   readonly property var g: root.svc ? root.svc : localSvc.item
 
@@ -801,13 +804,13 @@ Panel {
             }
           }
 
-          // Where this comes from: the rest of the G16's fixes (kernel, NVIDIA,
-          // Omarchy) are in the omarchy-asus repo.
+          // Where this comes from: omarchy-asus also fixes the rest of the
+          // laptop (kernel, NVIDIA, Omarchy) as a signed pacman repo.
           Text {
             visible: root.tab === 0
             width: parent.width
             horizontalAlignment: Text.AlignRight
-            text: "G16 Control · part of omarchy-asus"
+            text: "omarchy-asus · ASUS fixes for Omarchy"
             color: footerMouse.containsMouse ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.8)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -817,7 +820,7 @@ Panel {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: Qt.openUrlExternally("https://github.com/omarchy-asus/omarchy-asus")
+              onClicked: Qt.openUrlExternally("https://omarchy-asus.github.io")
             }
           }
 
