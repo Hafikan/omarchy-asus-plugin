@@ -24,6 +24,8 @@ BRIDGE = os.path.join(HERE, "..", "bridge", "asus_bridge.py")
 FAKES = os.path.join(HERE, "fake_services.py")
 AURA = "/xyz/ljones/aura/19b6_3_4"
 OVERDRIVE = "/xyz/ljones/asus_armoury/panel_overdrive"
+BAT = "/org/freedesktop/UPower/devices/battery_BAT1"
+HELD = "omarchy-asus-charge-limit"
 
 CONF = """# test
 INTERNAL_OUTPUT=eDP-1
@@ -35,6 +37,7 @@ KBD_BATTERY=off
 PANEL_OVERDRIVE_AC=1
 PANEL_OVERDRIVE_BATTERY=0
 """
+HOLD = CONF + "CHARGE_HOLD_WEAK_BARREL=1\n"
 
 
 class FakeHyprland:
@@ -111,7 +114,8 @@ class FakeHyprland:
 
 class Harness:
     def __init__(self, conf=CONF, asusd=True, on_battery=False, charge_mode=None, bright=None,
-                 slash_getall_fails=False, state_files=None, before=None, giant_hyprland=False):
+                 slash_getall_fails=False, state_files=None, before=None, giant_hyprland=False,
+                 hold_quiet=None):
         self.tmp = tempfile.mkdtemp(prefix="g16b-")
         t = self.tmp
         self.home = os.path.join(t, "home")
@@ -172,6 +176,8 @@ class Harness:
             self.fake({"set": ["/org/freedesktop/UPower", "org.freedesktop.UPower", "OnBattery", "b", True]})
         self.env = dict(base, XDG_RUNTIME_DIR=self.run_dir, HYPRLAND_INSTANCE_SIGNATURE="SIG",
                         G16_BRIDGE_SYSROOT=self.sys, G16_BRIDGE_WINLOCK=self.winlock)
+        if hold_quiet is not None:
+            self.env["G16_BRIDGE_HOLD_QUIET_S"] = str(hold_quiet)
         self.out = queue.Queue()
         self.states = []
         self.replies = {}
@@ -245,6 +251,32 @@ class Harness:
         # Only the AC adapter device: a weak adapter dropping out and back.
         self.fake({"set": ["/org/freedesktop/UPower/devices/line_power_ACAD",
                            "org.freedesktop.UPower.Device", "Online", "b", online]})
+
+    def flap(self, times=3):
+        for _ in range(times):
+            self.adapter(False)
+            self.adapter(True)
+
+    def battery(self, prop, sig, value):
+        self.fake({"set": [BAT, "org.freedesktop.UPower.Device", prop, sig, value]})
+
+    def charge_sets(self):
+        return [s[4] for s in self.sets("ChargeControlEndThreshold")]
+
+    def state_file(self, name):
+        path = os.path.join(self.state_dir, name)
+        return open(path).read().strip() if os.path.exists(path) else None
+
+    def stderr(self):
+        with open(os.path.join(self.tmp, "bridge.err")) as f:
+            return f.read()
+
+    def switches(self):
+        n = 0
+        for task in os.listdir(f"/proc/{self.bridge.pid}/task"):
+            with open(f"/proc/{self.bridge.pid}/task/{task}/status") as f:
+                n += sum(int(x.split()[1]) for x in f if "ctxt_switches" in x)
+        return n
 
     def power(self, on_battery):
         self.fake({"set": ["/org/freedesktop/UPower", "org.freedesktop.UPower", "OnBattery", "b", on_battery]})
@@ -333,6 +365,52 @@ class BridgeTest(unittest.TestCase):
         h.hypr.event("monitoraddedv2>>2,HDMI-A-1,Monitor", hz=240)
         h.wait(lambda: len(h.hypr.evals) == n + 2 and h.hypr.hz == 60, what="re-applied after hotplug")
         self.assertEqual(len(h.sets("Brightness")), brightness_sets, "a Hyprland event only touches the refresh rate")
+
+    def panel_rule(self, h):
+        d = os.path.join(h.home, ".config", "hypr")
+        os.makedirs(d)
+        with open(os.path.join(d, "monitors.lua"), "w") as f:
+            f.write('hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })\n'
+                    '-- hl.monitor({ output = "DP-2", mode = "2560x1440@144" })\n'
+                    'hl.monitor({ output = "eDP-1", mode = "2560x1600@240", position = "0x0", scale = 1.6 })\n')
+
+    def rate_rule(self, h):
+        try:
+            with open(os.path.join(h.state_dir, "toggles", "hypr", "omarchy-asus-refresh.lua")) as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def test_reload_carries_the_rate_when_monitors_lua_has_a_panel_rule(self):
+        h = self.harness(before=self.panel_rule)
+        h.wait(lambda: h.state.get("refreshHz") == 240 and h.state.get("hasAura"), what="AC applied")
+        # Only the mode, merged into the panel's own rule: no explicit scale or
+        # bit depth that the reloaded rule wouldn't carry.
+        self.assertEqual(h.hypr.evals, ['hl.monitor({ output = "eDP-1", mode = "2560x1600@240" })'])
+        self.assertIn('\nhl.monitor({ output = "eDP-1", mode = "2560x1600@240" })\n', self.rate_rule(h))
+        h.power(True)
+        h.wait(lambda: h.state.get("refreshHz") == 60 and self.rate_rule(h) and "@60\"" in self.rate_rule(h),
+               what="battery rate and rule")
+        h.hypr.event("configreloaded>>")   # the reload loaded the rule: still 60
+        time.sleep(1.5)
+        h.pump(0.1)
+        self.assertEqual(len(h.hypr.evals), 2, "no second modeset after a reload")
+        h.bridge.stdin.close()
+        h.bridge.wait(5)
+        self.assertIsNone(self.rate_rule(h), "no rule outlives the bridge")
+
+    def test_no_rate_rule_without_a_panel_rule_or_a_rate(self):
+        h = self.harness()
+        h.wait(lambda: h.state.get("refreshHz") == 240 and h.state.get("hasAura"), what="AC applied")
+        self.assertIn('position = "0x0", scale = 1.6, bitdepth = 10', h.hypr.evals[0])
+        self.assertIsNone(self.rate_rule(h), "a new panel rule would drop the catch-all's scale")
+        self.panel_rule(h)
+        os.makedirs(os.path.join(h.state_dir, "toggles", "hypr"))
+        with open(os.path.join(h.state_dir, "toggles", "hypr", "omarchy-asus-refresh.lua"), "w") as f:
+            f.write("-- left over\n")
+        with open(h.conf, "w") as f:
+            f.write("INTERNAL_OUTPUT=eDP-1\n")   # no HZ_* keys: no rate to keep
+        h.wait(lambda: self.rate_rule(h) is None, what="stale rule removed")
 
     def test_pin_beats_gaming_beats_power_source(self):
         h = self.harness()
@@ -435,16 +513,9 @@ class BridgeTest(unittest.TestCase):
         # emitting PropertiesChanged (the G16 saw ~10 wakeups a minute).
         h.fake({"noise": True})
         time.sleep(1.5)
-
-        def switches():
-            n = 0
-            for task in os.listdir(f"/proc/{h.bridge.pid}/task"):
-                with open(f"/proc/{h.bridge.pid}/task/{task}/status") as f:
-                    n += sum(int(x.split()[1]) for x in f if "ctxt_switches" in x)
-            return n
-        before = switches()
+        before = h.switches()
         time.sleep(6)
-        self.assertEqual(switches() - before, 0, "the idle bridge woke up")
+        self.assertEqual(h.switches() - before, 0, "the idle bridge woke up")
 
     def test_usb_c_uses_the_battery_settings(self):
         h = self.harness(charge_mode=2)   # bit 1: USB-C, bit 0 (barrel) clear
@@ -580,6 +651,94 @@ class BridgeTest(unittest.TestCase):
                                         ("nv_dynamic_boost", 5)])
         self.assertEqual(len(h.hypr.evals), evals, "no refresh-rate flips")
         self.assertEqual(h.brightness(), 80, "a weak barrel keeps the AC settings: not dimmed")
+        self.assertEqual(h.charge_sets(), [], "no CHARGE_HOLD_WEAK_BARREL: charging isn't held")
+
+    # ---- charge hold on a weak barrel (#165) ----
+    def test_a_weak_barrel_holds_charging_until_the_load_drops(self):
+        # The G16 on a 140 W barrel, gaming while charging from 70 %: the
+        # adapter dropped out about once a second and the EC clamped the CPU.
+        h = self.harness(conf=HOLD, charge_mode=1, hold_quiet=3)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("chargeLimit") == 80, what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="charging held at the charge")
+        self.assertEqual(h.charge_sets(), [50])
+        self.assertEqual(h.state["chargeLimit"], 80, "the panel still shows the user's limit")
+        self.assertEqual(h.state_file(HELD), "80")
+        h.battery("Percentage", "d", 48.0)          # the load outruns the adapter: the charge falls
+        h.wait(lambda: h.state.get("chargeHeld") == 48, what="ceiling lowered with the charge")
+        for _ in range(4):                          # discharging on AC: the load is still there
+            time.sleep(1.2)
+            h.battery("State", "u", 2)
+        h.send("get")
+        self.assertEqual(h.state["chargeHeld"], 48, "held while the battery helps carry the load")
+        h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=8, what="charging tried again")
+        self.assertEqual(h.charge_sets(), [50, 48, 80])
+        self.assertIsNone(h.state_file(HELD))
+        self.assertIn("charging resumed (quiet for 3 s): limit 80%", h.stderr())
+        # Released: the battery device is no longer followed.
+        h.fake({"noise": True})
+        time.sleep(1.5)
+        before = h.switches()
+        time.sleep(3)
+        self.assertEqual(h.switches() - before, 0, "the battery device still wakes the bridge")
+
+    def test_dropping_out_again_after_a_retry_holds_again_for_longer(self):
+        h = self.harness(conf=HOLD, charge_mode=1, hold_quiet=2)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=6, what="charging tried again")
+        h.flap(1)                                   # still too much: it drops out once more
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held again")
+        self.assertEqual(h.charge_sets(), [50, 80, 50])
+        self.assertIn("trying again in 4 s", h.stderr())
+
+    def test_unplugging_a_held_weak_barrel_puts_the_limit_back(self):
+        h = self.harness(conf=HOLD, charge_mode=1)  # 2 min quiet spell: only the unplug ends it here
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.power(True)
+        h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=15, what="unplugged for good")
+        self.assertEqual(h.charge_sets(), [50, 80])
+        self.assertIsNone(h.state_file(HELD))
+
+    def test_no_hold_at_or_above_the_limit(self):
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.battery("Percentage", "d", 80.0)          # at the limit: not charging anyway
+        h.flap()
+        h.wait(lambda: h.state.get("source") == "weak", what="weak barrel")
+        self.assertEqual((h.charge_sets(), h.state["chargeHeld"]), ([], 0))
+
+    def test_a_limit_picked_while_held_is_the_one_that_comes_back(self):
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        self.assertTrue(h.send("battery-limit", "100")["ok"])
+        self.assertEqual((h.state["chargeLimit"], h.state["chargeHeld"]), (100, 50))
+        self.assertEqual((h.charge_sets(), h.state_file(HELD)), ([50], "100"), "still held")
+        h.bridge.stdin.close()                      # the shell stops the bridge
+        self.assertEqual(h.bridge.wait(5), 0)
+        self.assertEqual(h.charge_sets(), [50, 100])
+        self.assertIsNone(h.state_file(HELD))
+
+    def test_a_limit_set_elsewhere_ends_the_hold(self):
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "ChargeControlEndThreshold", "y", 90]})
+        h.wait(lambda: h.state.get("chargeHeld") == 0 and h.state.get("chargeLimit") == 90, what="theirs stands")
+        self.assertEqual(h.charge_sets(), [50])
+        self.assertIsNone(h.state_file(HELD))
+
+    def test_a_limit_left_held_by_a_crash_is_put_back(self):
+        h = self.harness(state_files={HELD: "100\n"})
+        h.wait(lambda: h.state.get("chargeLimit") == 100, what="the saved limit back")
+        self.assertEqual(h.charge_sets(), [100])
+        self.assertIsNone(h.state_file(HELD))
 
     def test_profile_change_moves_the_curve(self):
         h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
@@ -667,6 +826,31 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(h.elsewhere, "state", "omarchy")), [],
                          "nothing written below the linked ancestor")
 
+    def test_a_dir_or_file_others_can_write_is_refused(self):
+        # Another user who can write a dir can swap the temporary file before
+        # the rename; one who can write a file can choose what's read.
+        def plant(h):
+            os.makedirs(h.state_dir)
+            pin = os.path.join(h.state_dir, "omarchy-asus-hz")
+            with open(pin, "w") as f:
+                f.write("60\n")
+            os.chmod(pin, 0o666)
+        h = self.harness(before=plant)
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        self.assertEqual(h.state["refreshOverride"], "auto", "a file others can write is not read")
+        self.assertTrue(h.send("refresh", "120")["ok"])
+        pin = os.path.join(h.state_dir, "omarchy-asus-hz")
+        self.assertEqual((h.state_file("omarchy-asus-hz"), oct(os.stat(pin).st_mode & 0o7777)), ("120", "0o644"),
+                         "replaced, and nobody else can write the new file")
+        self.assertEqual(h.state["refreshOverride"], "120")
+        os.chmod(h.state_dir, 0o777)
+        before = sorted(os.listdir(h.state_dir))
+        r = h.send("refresh", "90")
+        self.assertFalse(r["ok"])
+        self.assertIn("writable by group or others", r["error"])
+        self.assertEqual(h.state_file("omarchy-asus-hz"), "120")
+        self.assertEqual(sorted(os.listdir(h.state_dir)), before, "nothing written in a dir others can write")
+
     def test_files_under_their_old_names_are_renamed_once(self):
         def old(h):
             os.makedirs(os.path.dirname(h.conf))
@@ -705,10 +889,79 @@ class BridgeTest(unittest.TestCase):
         h.send("get")                     # a re-read sees the panel again (at its current 60 Hz)
         h.wait(lambda: h.state.get("hasPanel") and h.state.get("refreshHz") == 60, what="normal again")
 
+    def test_numbers_out_of_range_from_dbus_and_hyprland_are_ignored(self):
+        # A charge that isn't a number in 0..100, a limit that isn't a number,
+        # a refresh rate that isn't finite: each is ignored, and the bridge
+        # keeps answering (an exception in a callback used to drop the stdin
+        # watch, or the hold, with a traceback).
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("chargeLimit") == 80, what="barrel")
+        h.battery("Percentage", "d", float("nan"))
+        h.flap()
+        h.wait(lambda: h.state.get("source") == "weak", what="weak barrel")
+        self.assertEqual((h.charge_sets(), h.state["chargeHeld"]), ([], 0), "no hold from a NaN charge")
+        h.battery("Percentage", "d", 50.0)
+        h.flap(1)
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.battery("Percentage", "d", float("-inf"))
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "ChargeControlEndThreshold", "s", "lots"]})
+        h.hypr.hz = float("inf")
+        self.assertTrue(h.send("get")["ok"])
+        self.assertEqual((h.state["chargeHeld"], h.state["chargeLimit"], h.state["refreshHz"]), (50, 80, 0))
+        self.assertTrue(h.send("battery-limit", "100")["ok"], "still taking commands")
+        h.err.flush()
+        self.assertNotIn("Traceback", h.stderr())
+        self.assertNotIn("uncaught", h.stderr())
+
+    def test_an_uncaught_exception_is_one_bounded_log_line(self):
+        r = subprocess.run([sys.executable, "-I", "-B", "-c",
+                            "import importlib.util as u, sys; s = u.spec_from_file_location('b', sys.argv[1]); "
+                            "s.loader.exec_module(u.module_from_spec(s)); "
+                            "raise ValueError('x' * 100000 + '\\n' + 'y' * 100000)", BRIDGE],
+                           capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(len(r.stderr.splitlines()), 1, r.stderr[:500])
+        self.assertTrue(r.stderr.startswith("omarchy-asus: uncaught ValueError: xxx"), r.stderr[:500])
+        self.assertLess(len(r.stderr), 400)
+
     def test_overlong_settings_values_are_ignored(self):
         h = self.harness(conf=CONF.replace("KBD_AC=med", "KBD_AC=" + "m" * 1000))
         h.wait(lambda: h.state.get("hasAura"), what="started")
         self.assertEqual(h.state["kbdAC"], "")
+
+    def test_settings_values_are_ascii(self):
+        # "²".isdigit() is true and int("²") fails: only ASCII values are read.
+        h = self.harness(conf=CONF.replace("HZ_GAMING=165", "HZ_GAMING=²"))
+        h.wait(lambda: h.state.get("hasAura") and h.state.get("refreshHz") == 240, what="started")
+        evals = len(h.hypr.evals)
+        self.assertTrue(h.send("gaming", "on")["ok"])
+        self.assertEqual(len(h.hypr.evals), evals, "no modeset from a value that isn't a number")
+        h.err.flush()
+        self.assertNotIn("uncaught", h.stderr())
+
+    def test_non_ascii_digits_in_state_files_are_ignored(self):
+        # "ac ²" used to raise out of apply_limits and stop the bridge at start.
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2,
+                         state_files={"omarchy-asus-ppt-groups": "ac ²\n", "omarchy-asus-ppt-curves": "² 1\n"})
+        h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits")
+        self.assertEqual(h.curve_calls(), [[1, "CPU", False], [0, "CPU", True]], "only the ASCII entry read")
+        self.assertTrue(h.send("get")["ok"])
+        self.assertEqual(h.bridge.poll(), None)
+        self.assertNotIn("uncaught", h.stderr())
+
+    def test_a_value_asusd_mangles_does_not_stop_the_cleanup(self):
+        # A charge limit that isn't a number when the bridge stops: the limit
+        # can't be put back, but the refresh-rate rule is still removed.
+        h = self.harness(conf=HOLD, charge_mode=1, before=self.panel_rule)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("chargeLimit") == 80
+               and self.rate_rule(h), what="barrel and rate rule")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "ChargeControlEndThreshold", "s", "lots"]})
+        h.bridge.stdin.close()
+        self.assertEqual(h.bridge.wait(5), 0, h.stderr()[-500:])
+        self.assertIsNone(self.rate_rule(h), "no rule outlives the bridge")
+        self.assertEqual(h.state_file(HELD), "80", "kept, so the next start puts it back")
 
     def test_release_turns_everything_off_before_removal(self):
         h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
@@ -723,6 +976,16 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(h.group_sets()[-1:], [[False, "plugged", 0]])
         state = lambda n: open(os.path.join(h.state_dir, n)).read().strip()
         self.assertEqual((state("omarchy-asus-ppt-curves"), state("omarchy-asus-ppt-groups")), ("", ""))
+
+    def test_a_malformed_request_does_not_stop_the_commands(self):
+        h = self.harness()
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        for bad in ({"id": None, "cmd": "get"}, {"id": [1], "cmd": "get"}, ["get"]):
+            h.bridge.stdin.write(json.dumps(bad) + "\n")
+        for bad in ('{"id": Infinity, "cmd": "get"}', '{"id": NaN, "cmd": "get"}', '{"id": "²", "cmd": "get"}'):
+            h.bridge.stdin.write(bad + "\n")
+        h.bridge.stdin.flush()
+        self.assertTrue(h.send("get")["ok"], "the bridge still answers after bad requests")
 
     def test_closing_stdin_stops_the_bridge(self):
         h = self.harness()

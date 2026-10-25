@@ -13,10 +13,15 @@ What it follows, all pushed, nothing on a timer:
     (brightness, colour, power flags), the lid Slash bar, the battery charge
     limit and panel overdrive, through PropertiesChanged signals. asusd
     leaving or coming back is seen as a bus name change.
-  - UPower's OnBattery (system bus).
+  - UPower's OnBattery and its AC adapter devices (system bus); the battery
+    device only while charging is held on a weak barrel (below).
   - Hyprland's event socket: a monitor hotplug or a config reload re-applies
     monitors.lua, which puts the internal panel back on its native refresh
-    rate, so both re-apply the per-source refresh rate.
+    rate, so both re-apply the per-source refresh rate. When monitors.lua has
+    a rule of its own for the panel, the rate also goes into Omarchy's
+    generated toggles (~/.local/state/omarchy/toggles/hypr/
+    omarchy-asus-refresh.lua, loaded after monitors.lua and merged into that
+    rule), so a reload already carries it and doesn't modeset the panel twice.
   - The keyboard LED's brightness_hw_changed (Fn+F2/F3 bypass asusd), and
     the settings and state files below, through inotify.
 
@@ -35,12 +40,29 @@ never sourced):
   PPT_AC / PPT_USBC / PPT_WEAK_BARREL     "SPL SPPT FPPT" in W for that source
   BOOST_AC / BOOST_USBC / BOOST_WEAK_BARREL
                                         NVIDIA Dynamic Boost (W) for that source
+  CHARGE_HOLD_WEAK_BARREL               1 = hold charging on a weak barrel while
+                                        it can't carry the load and charge too
 A USB-C charger counts as battery: barrel = full power, USB-C and battery
 save. A barrel that drops out 3 or more times in 30 s (counted on UPower's
 line-power device: a flapping adapter doesn't flip OnBattery) is a weak barrel (a
 third-party adapter that can't carry the load): it keeps the AC settings and
 gets the PPT_WEAK_BARREL limits until it's unplugged for good. Power-source
 changes apply once the source has been stable for 1.5 s.
+
+Charge hold (CHARGE_HOLD_WEAK_BARREL=1): load plus charging asks more of a
+weak barrel than it gives, so it drops out about once a second and the EC
+clamps the CPU. While the barrel is weak, each time it comes back online
+the charge limit is set to the current charge (asusd's floor 20 %), which
+stops charging; the user's limit is kept in ~/.local/state/omarchy
+(omarchy-asus-charge-limit) and put back after a crash. While held, the
+battery device is followed: a falling charge lowers the ceiling with it,
+and the battery discharging on AC (the load is more than the adapter alone
+carries) keeps the hold. Held, the battery is idle whatever the load, so
+nothing reports the load dropping: after a quiet spell (2 min) the limit is
+put back and charging is tried again. If the barrel drops out again, the
+hold returns and the next quiet spell is twice as long (up to 30 min).
+Unplugging for good, a limit set elsewhere, or the key going away ends the
+hold. The quiet-spell timer exists only while charging is held.
 
 The PPT limits only take effect while the CPU custom fan curve is on (BIOS
 307 measured: a limit written in auto fan mode is stored but ignored, and
@@ -96,7 +118,8 @@ AURA = "xyz.ljones.Aura"
 SLASH = "xyz.ljones.Slash"
 UPOWER = "org.freedesktop.UPower"
 UPOWER_DEVICE = "org.freedesktop.UPower.Device"
-LINE_POWER = 1  # UPower device type
+LINE_POWER, BATTERY = 1, 2  # UPower device types
+DISCHARGING = 2             # UPower battery state
 PROPS = "org.freedesktop.DBus.Properties"
 SYSTEMD = "org.freedesktop.systemd1"
 LEVELS = ["off", "low", "med", "high"]
@@ -122,7 +145,7 @@ UNIT_STATES = {"active", "inactive", "failed", "activating", "deactivating", "re
 CONF_KEYS = {"PPT_AC", "PPT_USBC", "PPT_WEAK_BARREL", "BOOST_AC", "BOOST_USBC",
              "BOOST_WEAK_BARREL", "KBD_AC", "KBD_BATTERY", "HZ_AC", "HZ_BATTERY", "HZ_GAMING",
              "PANEL_OVERDRIVE_AC", "PANEL_OVERDRIVE_BATTERY", "INTERNAL_OUTPUT",
-             "BITDEPTH", "BRIGHT_BATTERY", "BRIGHT_DEVICE"}
+             "BITDEPTH", "BRIGHT_BATTERY", "BRIGHT_DEVICE", "CHARGE_HOLD_WEAK_BARREL"}
 LOGIND = "org.freedesktop.login1"
 PLATFORM = "xyz.ljones.Platform"
 FANCURVES = "xyz.ljones.FanCurves"
@@ -130,6 +153,8 @@ PPT_ATTRS = ["ppt_pl1_spl", "ppt_pl2_sppt", "ppt_pl3_fppt"]
 BOOST_ATTR = "nv_dynamic_boost"
 DEBOUNCE_MS = 1500
 WEAK_EDGES, WEAK_WINDOW, WEAK_CLEAR_S = 3, 30.0, 10
+CHARGE_FLOOR = 20                       # asusd refuses a lower charge limit
+HOLD_QUIET_MAX, HOLD_RETRY_S = 1800, 120
 
 
 def env(name, default=""):
@@ -152,6 +177,10 @@ WINLOCK_MODE_CONF = os.path.join(WINLOCK_DROPIN, "mode.conf")
 # the barrel backlight level saved when leaving it.
 SEEN_NAME, SAVED_NAME = "omarchy-asus.source", "omarchy-asus.bright-ac"
 CURVES_NAME, GROUPS_NAME = "omarchy-asus-ppt-curves", "omarchy-asus-ppt-groups"
+# The panel's rate as a Hyprland rule that Omarchy loads on every reload.
+RATE_RULE_NAME = "omarchy-asus-refresh.lua"
+# The user's charge limit while charging is held on a weak barrel.
+HOLD_NAME = "omarchy-asus-charge-limit"
 # The names these files had before 1.6.0, renamed once (migrate_names).
 OLD_CONF_NAMES = {"power-tune.conf": CONF_NAME}
 OLD_STATE_NAMES = {"power-tune-hz": PIN_NAME, "power-tune-gaming": GAMING_NAME,
@@ -159,13 +188,53 @@ OLD_STATE_NAMES = {"power-tune-hz": PIN_NAME, "power-tune-gaming": GAMING_NAME,
                    "g16-ppt-curves": CURVES_NAME, "g16-ppt-groups": GROUPS_NAME}
 # Tests point these at a temp tree; on a real system they are the defaults.
 SYSROOT = env("G16_BRIDGE_SYSROOT", "/sys")
+HOLD_QUIET_S = int(env("G16_BRIDGE_HOLD_QUIET_S", "120"))
 WINLOCK_PATH = env("G16_BRIDGE_WINLOCK", WINLOCK_BIN)
 
 
 def log(msg):
     # Bounded and printable: the shell forwards these lines to its journal.
-    text = re.sub(r"[^\x20-\x7e]", "?", str(msg))[:300]
+    text = re.sub(r"[^\x20-\x7e]", "?", str(msg)[:300])
     print(f"omarchy-asus: {text}", file=sys.stderr, flush=True)
+
+
+# An exception no handler caught (in a GLib callback, say) is one log line
+# too, never a traceback: stderr stays bounded here, at the producer.
+sys.excepthook = lambda t, e, _tb: log(f"uncaught {t.__name__}: {e}")
+
+
+def number(v, lo, hi):
+    """v when it's a real number in [lo, hi], else None. Values from D-Bus
+    and Hyprland are checked before any arithmetic."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
+        return None
+    return v
+
+
+def dbus_int(variant, lo, hi):
+    """A D-Bus property's value as an int in [lo, hi], else None."""
+    v = number(variant.unpack(), lo, hi)
+    return None if v is None else int(v)
+
+
+def digits(s, hi=999999999):
+    """s as an int when it is 1-9 ASCII digits and at most hi, else None.
+    Files and settings are parsed with this, never isdigit(): "²".isdigit()
+    is true and int("²") fails."""
+    if not isinstance(s, str) or not re.fullmatch(r"[0-9]{1,9}", s):
+        return None
+    v = int(s)
+    return v if v <= hi else None
+
+
+def each(why, *steps):
+    """Run every step, each on its own: one that fails is logged and the
+    next still runs (cleanup when the bridge stops, and `release`)."""
+    for step in steps:
+        try:
+            step()
+        except Exception as e:
+            log(f"{why}: {type(e).__name__}: {getattr(e, 'message', None) or e}")
 
 
 # ------------------------------------------------------------------ safe files
@@ -176,11 +245,16 @@ def log(msg):
 #     is refused, and each step must be ours or a root-owned system dir;
 #   - each dir below it is opened (or created) relative to that descriptor
 #     with O_NOFOLLOW, and must be owned by us too;
-#   - a write goes to a new private temporary file (O_CREAT|O_EXCL|O_NOFOLLOW,
-#     random name) in that dir, is fsynced and renamed over the target; a
-#     target that is a symbolic link is refused, not followed;
+#   - no dir of ours on the way is writable by group or others: nobody else
+#     can rename an entry in it, so a temporary file can't be swapped for
+#     another before the rename;
+#   - a write goes to a new 0600 temporary file (O_CREAT|O_EXCL|O_NOFOLLOW,
+#     random name) in that dir, is given its final mode on its descriptor,
+#     fsynced and renamed over the target; a target that is a symbolic link
+#     is refused, not followed;
 #   - reads are opened with O_NOFOLLOW, descriptor-checked (a regular file of
-#     ours) and size-capped; a symbolic link is not read, and says so.
+#     ours that nobody else can write) and size-capped; a symbolic link is not
+#     read, and says so.
 UID = os.getuid()
 O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 MAX_FILE = 64 * 1024
@@ -195,6 +269,8 @@ def _check_owner(fd, what):
     st = os.fstat(fd)
     if st.st_uid != UID:
         raise UnsafePath(f"{what} is not owned by this user")
+    if st.st_mode & 0o022:
+        raise UnsafePath(f"{what} is writable by group or others")
     return st
 
 
@@ -231,6 +307,8 @@ class Dir:
                 fd = nfd
                 st = os.fstat(fd)
                 mine = st.st_uid == UID
+                if mine and st.st_mode & 0o022:
+                    raise UnsafePath(f"{base}: {part} is writable by group or others")
                 if not mine and (st.st_uid != 0 or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX)):
                     raise UnsafePath(f"{base}: {part} is neither ours nor a safe system directory")
             _check_owner(fd, base)
@@ -257,7 +335,8 @@ class Dir:
 
     def read(self, name):
         """The file's text, or None if it's missing, a symbolic link, not a
-        regular file of ours, or larger than MAX_FILE."""
+        regular file of ours, writable by group or others, or larger than
+        MAX_FILE."""
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
         try:
             fd = os.open(name, flags, dir_fd=self.fd)
@@ -268,6 +347,9 @@ class Dir:
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_uid != UID:
+                return None
+            if st.st_mode & 0o022:
+                log(f"{name} is writable by group or others; not read")
                 return None
             data = os.read(fd, MAX_FILE + 1)
             if len(data) > MAX_FILE:
@@ -298,13 +380,17 @@ class Dir:
             mode = stat.S_IMODE(st.st_mode)
         except FileNotFoundError:
             pass
+        # The user's own read bits carry over; never a write bit for anyone
+        # else, nor setuid/setgid/sticky.
+        mode &= 0o755
         tmp = f".{name}.{secrets.token_hex(6)}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                     mode, dir_fd=self.fd)
+                     0o600, dir_fd=self.fd)
         try:
             data = text.encode("utf-8")
             while data:
                 data = data[os.write(fd, data):]
+            os.fchmod(fd, mode)
             os.fsync(fd)
             os.close(fd)
             fd = -1
@@ -338,6 +424,45 @@ def dropin_dir(create=True):
     return Dir(CONFIG_HOME, ["systemd", "user", WINLOCK_UNIT + ".d"], create)
 
 
+def toggles_dir(create=True):
+    return Dir(STATE_HOME, ["omarchy", "toggles", "hypr"], create)
+
+
+def hypr_config_dir():
+    return Dir(CONFIG_HOME, ["hypr"], create=False)
+
+
+def panel_rule_in_monitors_lua(output):
+    """Whether ~/.config/hypr/monitors.lua has an hl.monitor() line naming
+    this output (the same line match Omarchy's clamshell script uses). Only
+    then does a mode-only rule merge into the user's rule; anything else
+    (a desc: rule, a multi-line call, only the catch-all rule) answers no."""
+    try:
+        with hypr_config_dir() as d:
+            text = d.read("monitors.lua")
+    except OSError:
+        return False
+    pat = re.compile(r'\s*hl\.monitor\(\s*\{.*\boutput\s*=\s*"%s"' % re.escape(output))
+    return bool(text) and any(pat.match(line) for line in text.splitlines())
+
+
+def write_rate_rule(text):
+    """Keep RATE_RULE_NAME at `text` (None removes it). Written only when it
+    changes: Hyprland reloads when a file it loaded is rewritten."""
+    try:
+        with toggles_dir(create=text is not None) as d:
+            if text is None:
+                if d.is_file(RATE_RULE_NAME):
+                    d.remove(RATE_RULE_NAME)
+                    log(f"removed {RATE_RULE_NAME}")
+            elif d.read(RATE_RULE_NAME) != text:
+                d.write(RATE_RULE_NAME, text)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(f"{RATE_RULE_NAME}: {e}")
+
+
 def state_read(name):
     try:
         with state_dir(create=False) as d:
@@ -367,7 +492,8 @@ def state_int(name):
 # ------------------------------------------------------------------ files
 def read_conf():
     """KEY=VALUE lines; quotes stripped; anything else ignored (never sourced).
-    Values are short tokens: anything longer than 64 characters is dropped."""
+    Values are short printable ASCII tokens: anything else, or longer than 64
+    characters, is dropped; numbers in them are read with digits()."""
     out = {}
     try:
         with config_dir(create=False) as d:
@@ -378,7 +504,7 @@ def read_conf():
         if len(line) > 512:
             continue
         m = re.match(r"^\s*([A-Z_]+)=([\"']?)(.*?)\2\s*(?:#.*)?$", line)
-        if m and m.group(1) in CONF_KEYS and len(m.group(3)) <= 64:
+        if m and m.group(1) in CONF_KEYS and re.fullmatch(r"[\x20-\x7e]{0,64}", m.group(3)):
             out[m.group(1)] = m.group(3).strip()
     return out
 
@@ -530,7 +656,7 @@ class Hyprland:
     def monitors(self):
         try:
             data = json.loads(self.request("j/monitors"))
-            return data if isinstance(data, list) else []
+            return [m for m in data if isinstance(m, dict)][:64] if isinstance(data, list) else []
         except OSError as e:
             log(f"Hyprland monitors: {e}")
             return []
@@ -599,6 +725,13 @@ class Bridge:
         self.fancurves = None     # path of xyz.ljones.FanCurves
         self.limits_on = False
         self.line_power = []      # UPower line-power device paths
+        self.battery = None       # UPower battery device path
+        self.battery_sub = 0      # its PropertiesChanged subscription, only while held
+        self.held = 0             # the charge ceiling we hold at, or 0
+        self.held_writes = set()  # ceilings written during this hold (their echoes are ours)
+        self.hold_timer = 0
+        self.hold_quiet = HOLD_QUIET_S
+        self.released_at = 0.0    # monotonic time charging was last tried again
         self.conf = read_conf()
         self.aura = None      # object path
         self.slash = None
@@ -632,8 +765,9 @@ class Bridge:
         bright = aura.get("Brightness", 0)
         lmd = aura.get("LedModeData")
         color = "FF00FF"
-        if isinstance(lmd, (list, tuple)) and len(lmd) >= 3 and len(lmd[2]) == 3:
-            color = "".join(f"{int(c) & 255:02X}" for c in lmd[2])
+        if (isinstance(lmd, (list, tuple)) and len(lmd) >= 3 and isinstance(lmd[2], (list, tuple))
+                and len(lmd[2]) == 3 and all(number(c, 0, 255) is not None for c in lmd[2])):
+            color = "".join(f"{int(c):02X}" for c in lmd[2])
         power = aura.get("LedPower")
         flags = [True, True, True, True]
         try:
@@ -644,8 +778,10 @@ class Bridge:
         # Only asusd can set the limit, so without it the section hides (0).
         charge = 0
         if self.charge:
-            charge = charge_limit_sysfs()
-            charge = int(self.cache.get(self.charge, {}).get(CHARGE_PROP, charge) or charge)
+            charge = int(number(self.cache.get(self.charge, {}).get(CHARGE_PROP), 1, 100)
+                         or charge_limit_sysfs())
+            if self.held:
+                charge = state_int(HOLD_NAME) or charge
         pin = pinned_hz()
         s = {
             "type": "state", "ack": self.ack,
@@ -659,10 +795,11 @@ class Bridge:
             "kbdBoot": flags[0], "kbdAwake": flags[1], "kbdSleep": flags[2], "kbdShutdown": flags[3],
             "hasSlash": bool(self.slash),
             "slashOn": bool(slash.get("Enabled", False)),
-            "slashBrightness": int(slash.get("Brightness", 0) or 0),
+            "slashBrightness": int(number(slash.get("Brightness"), 0, 255) or 0),
             "slashPattern": self.slash_pattern(slash),
             "slashModes": SLASH_MODES,
             "chargeLimit": charge,
+            "chargeHeld": self.held,
             "hasPanel": bool(self.output),
             "refreshHz": self.refresh_hz,
             "refreshOverride": str(pin) if pin else "auto",
@@ -797,12 +934,15 @@ class Bridge:
 
     def asusd_appeared(self, *_):
         self.discover()
+        self.restore_limit("asusd")
         self.apply("asusd")
         self.emit()
 
     def asusd_vanished(self, *_):
         self.aura = self.slash = self.charge = self.overdrive = None
         self.cache = {}
+        # The saved limit stays on disk: it goes back when asusd returns.
+        self.end_hold()
         self.emit()
 
     def props_changed(self, _conn, _sender, path, _iface, _signal, params):
@@ -813,12 +953,26 @@ class Bridge:
                 self.on_battery = bool(changed["OnBattery"])
                 # The adapter's own edges are counted where there is one.
                 self.power_edge(count=not self.line_power)
+                if not self.line_power and not self.on_battery:
+                    self.hold_charge("charger back online")
             self.emit()
             return
         if iface == UPOWER_DEVICE and path in self.line_power:
             if "Online" in changed:
                 self.power_edge(count=True)
+                if changed["Online"]:
+                    self.hold_charge("charger back online")
             return
+        if iface == UPOWER_DEVICE and path == self.battery:
+            self.battery_changed(changed)
+            return
+        if key == self.charge and CHARGE_PROP in changed and self.held:
+            v = number(changed[CHARGE_PROP], 0, 100)
+            if v is not None and int(v) not in self.held_writes:
+                # Someone else set the limit: theirs stands.
+                log(f"charge limit set to {v}% elsewhere; charge hold ended")
+                state_remove(HOLD_NAME)
+                self.end_hold()
         if iface == PLATFORM and "PlatformProfile" in changed and self.limits_on:
             # Omarchy switches the profile on a charger change: the curve
             # gate belongs to the new profile now.
@@ -858,7 +1012,8 @@ class Bridge:
 
     def find_line_power(self):
         """UPower's line-power (AC adapter) devices. Their Online property
-        toggles each time a weak adapter drops out, while OnBattery may not."""
+        toggles each time a weak adapter drops out, while OnBattery may not.
+        The first battery device is noted for the charge hold."""
         out = []
         try:
             paths = self.call(self.system, UPOWER, "/org/freedesktop/UPower", UPOWER,
@@ -874,6 +1029,8 @@ class Bridge:
                 continue
             if t == LINE_POWER:
                 out.append(path)
+            elif t == BATTERY and not self.battery:
+                self.battery = path
         return out
 
     def power_edge(self, count=True):
@@ -896,6 +1053,7 @@ class Bridge:
                     self.weak = False
                     self.edges = []
                     log("weak barrel cleared")
+                    self.release_hold("unplugged")
                 return False
             self.weak_clear_timer = GLib.timeout_add_seconds(WEAK_CLEAR_S, clear)
         if self.debounce_timer:
@@ -938,10 +1096,9 @@ class Bridge:
         pin = pinned_hz()
         if pin:
             return pin
-        if gaming_on() and self.conf.get("HZ_GAMING", "").isdigit():
-            return int(self.conf["HZ_GAMING"])
-        v = self.conf.get("HZ_" + self.source(), "")
-        return int(v) if v.isdigit() else None
+        if gaming_on() and digits(self.conf.get("HZ_GAMING"), 1000):
+            return digits(self.conf["HZ_GAMING"])
+        return digits(self.conf.get("HZ_" + self.source()), 1000) or None
 
     def apply(self, why, refresh_only=False):
         """Apply the settings for the current power source. Keys that are not
@@ -960,6 +1117,8 @@ class Bridge:
         if od in ("0", "1") and self.overdrive:
             self.set_overdrive(int(od))
         self.apply_limits(why)
+        if self.held and not self.hold_wanted():
+            self.release_hold(why)
 
     # ---- per-source power limits (#34) ----
     def wanted_limits(self):
@@ -967,16 +1126,12 @@ class Bridge:
         key = {"ac": "AC", "weak": "WEAK_BARREL", "usbc": "USBC"}.get(self.kind)
         if not key:
             return None, None
-        ppt = self.conf.get("PPT_" + key, "").split()
-        ppt = [int(x) for x in ppt] if len(ppt) == 3 and all(x.isdigit() for x in ppt) else None
-        b = self.conf.get("BOOST_" + key, "")
-        return ppt, (int(b) if b.isdigit() else None)
+        ppt = [digits(x) for x in self.conf.get("PPT_" + key, "").split()]
+        ppt = ppt if len(ppt) == 3 and None not in ppt else None
+        return ppt, digits(self.conf.get("BOOST_" + key))
 
     def read_curves(self):
-        try:
-            return [int(x) for x in state_read(CURVES_NAME).split()[:8] if x.isdigit()]
-        except ValueError:
-            return []
+        return [v for v in (digits(x, 255) for x in state_read(CURVES_NAME).split()[:8]) if v is not None]
 
     def set_curve(self, profile, on):
         # Only the CPU fan's curve gates the PPT; asusd persists the flag per
@@ -1007,16 +1162,24 @@ class Bridge:
                 pass
         if "CurrentValue" not in props:
             return
-        lo, hi = (int(props[p].unpack()) if p in props else -1 for p in ("MinValue", "MaxValue"))
+        # Every value asusd reports is checked: anything but a number in range
+        # reads as missing (-1, asusd's own "none"), and a current value that
+        # isn't one is left alone.
+        lo, hi, dflt, cur = (dbus_int(props[p], -1, 1000000) if p in props else None
+                             for p in ("MinValue", "MaxValue", "DefaultValue", "CurrentValue"))
+        lo, hi = (-1 if x is None else x for x in (lo, hi))
+        if cur is None:
+            log(f"{name}: asusd reported no usable current value")
+            return
         if default:
-            value = int(props["DefaultValue"].unpack()) if "DefaultValue" in props else -1
-            if value < 0:
+            if dflt is None or dflt < 0:
                 return
+            value = dflt
         if 0 <= lo <= hi and hi > 0:
             value = max(lo, min(hi, value))
         elif hi == 0 and value != 0:
             return                      # not adjustable on this source (e.g. boost on battery)
-        if int(props["CurrentValue"].unpack()) != value:
+        if cur != value:
             self.set_prop(path, iface, "CurrentValue",
                           GLib.Variant(props["CurrentValue"].get_type_string(), value))
             log(f"{name} -> {value}")
@@ -1025,8 +1188,8 @@ class Bridge:
         out = []
         for line in state_read(GROUPS_NAME).splitlines()[:16]:
             parts = line.split()
-            if len(parts) == 2 and parts[0] in ("ac", "dc") and parts[1].isdigit():
-                out.append((parts[0], int(parts[1])))
+            if len(parts) == 2 and parts[0] in ("ac", "dc") and digits(parts[1], 255) is not None:
+                out.append((parts[0], digits(parts[1])))
         return out
 
     def write_groups(self, groups):
@@ -1057,7 +1220,10 @@ class Bridge:
         ppt, boost = self.wanted_limits()
         try:
             stale = self.read_curves()
-            profile = int(self.raw_prop(self.platform, PLATFORM, "PlatformProfile").unpack())
+            profile = dbus_int(self.raw_prop(self.platform, PLATFORM, "PlatformProfile"), 0, 255)
+            if profile is None:
+                log(f"power limits ({why}): asusd reported no usable platform profile")
+                return
             if ppt is None and boost is None:
                 if self.limits_on or stale or self.read_groups():
                     for p in stale:
@@ -1089,6 +1255,130 @@ class Bridge:
         except (GLib.Error, OSError) as e:
             log(f"power limits ({why}): {getattr(e, 'message', e)}")
 
+    # ---- charge hold on a weak barrel (#165) ----
+    def hold_wanted(self):
+        return self.weak and bool(self.charge) and self.conf.get("CHARGE_HOLD_WEAK_BARREL", "") == "1"
+
+    def battery_percent(self):
+        if not self.battery:
+            return None
+        try:
+            v = self.call(self.system, UPOWER, self.battery, PROPS, "Get",
+                          GLib.Variant("(ss)", (UPOWER_DEVICE, "Percentage")), "(v)")
+            return number(v.unpack()[0], 0, 100)
+        except GLib.Error as e:
+            log(f"battery charge: {getattr(e, 'message', e)}")
+            return None
+
+    def user_limit(self):
+        v = self.cache.get(self.charge, {}).get(CHARGE_PROP) if self.charge else None
+        return int(number(v, 1, 100) or charge_limit_sysfs())
+
+    def set_ceiling(self, value):
+        path, iface = self.charge
+        self.held_writes.add(value)
+        v = self.raw_prop(path, iface, CHARGE_PROP)
+        self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), value))
+        self.held = value
+
+    def hold_charge(self, why):
+        """The weak barrel is back online after dropping out: hold charging at
+        the current charge, or, if it's held already, start the quiet spell
+        over (the load is still more than the barrel gives)."""
+        if not self.hold_wanted():
+            return
+        if self.held:
+            self.start_quiet()
+            return
+        pct, limit = self.battery_percent(), self.user_limit()
+        if pct is None or not limit:
+            return
+        ceiling = max(CHARGE_FLOOR, int(pct))
+        if ceiling >= limit:
+            return                      # at or above the limit: not charging anyway
+        # Dropping out again soon after charging was tried: wait longer next time.
+        now = GLib.get_monotonic_time() / 1e6
+        if self.released_at and now - self.released_at <= HOLD_RETRY_S:
+            self.hold_quiet = min(HOLD_QUIET_MAX, self.hold_quiet * 2)
+        else:
+            self.hold_quiet = HOLD_QUIET_S
+        try:
+            state_write(HOLD_NAME, str(limit))      # first, so a crash can't lose it
+            self.held_writes = set()
+            self.set_ceiling(ceiling)
+        except (GLib.Error, OSError) as e:
+            log(f"charge hold: {getattr(e, 'message', e)}")
+            self.held = 0
+            state_remove(HOLD_NAME)
+            return
+        # The battery device changes every few seconds: followed only while held.
+        self.battery_sub = self.system.signal_subscribe(UPOWER, PROPS, "PropertiesChanged", self.battery,
+                                                        None, Gio.DBusSignalFlags.NONE, self.props_changed)
+        self.start_quiet()
+        log(f"{why}: holding charging at {ceiling}% (limit {limit}%; trying again in {self.hold_quiet} s)")
+        self.emit()
+
+    def start_quiet(self):
+        if self.hold_timer:
+            GLib.source_remove(self.hold_timer)
+
+        def quiet():
+            self.hold_timer = 0
+            self.released_at = GLib.get_monotonic_time() / 1e6
+            self.release_hold(f"quiet for {self.hold_quiet} s")
+            return False
+        self.hold_timer = GLib.timeout_add_seconds(self.hold_quiet, quiet)
+
+    def battery_changed(self, changed):
+        if not self.held:
+            return
+        if changed.get("State") == DISCHARGING and not self.on_battery:
+            self.start_quiet()          # the load is more than the adapter alone carries
+        pct = number(changed.get("Percentage"), 0, 100)
+        if pct is not None and max(CHARGE_FLOOR, int(pct)) < self.held:
+            try:
+                self.set_ceiling(max(CHARGE_FLOOR, int(pct)))
+                log(f"charge fell under load: holding at {self.held}%")
+            except GLib.Error as e:
+                log(f"charge hold: {e.message}")
+            self.emit()
+
+    def release_hold(self, why):
+        """Put the user's limit back and stop following the battery."""
+        if not self.held:
+            return
+        self.end_hold()
+        self.restore_limit(why)
+
+    def end_hold(self):
+        if self.hold_timer:
+            GLib.source_remove(self.hold_timer)
+            self.hold_timer = 0
+        if self.battery_sub:
+            self.system.signal_unsubscribe(self.battery_sub)
+            self.battery_sub = 0
+        self.held = 0
+        self.held_writes = set()
+        self.emit()
+
+    def restore_limit(self, why):
+        """Put back the limit a hold saved: this one's, or one a crash or
+        asusd leaving cut short. Kept on disk until it's back."""
+        saved = state_int(HOLD_NAME)
+        if saved is None or not self.charge:
+            return
+        if CHARGE_FLOOR <= saved <= 100:
+            path, iface = self.charge
+            try:
+                v = self.raw_prop(path, iface, CHARGE_PROP)
+                if dbus_int(v, 0, 100) != saved:
+                    self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), saved))
+                log(f"charging resumed ({why}): limit {saved}%")
+            except GLib.Error as e:
+                log(f"charge limit {saved}: {e.message}")
+                return
+        state_remove(HOLD_NAME)
+
     def adjust_brightness(self):
         """The backlight step, edge-triggered on the source class
         (ac / not ac) against the last apply: leaving the barrel dims to
@@ -1103,9 +1393,9 @@ class Bridge:
             state_write(SEEN_NAME, cls)
         except OSError as e:
             log(f"cannot record the power source: {e}")
-        pct = self.conf.get("BRIGHT_BATTERY", "")
+        pct = digits(self.conf.get("BRIGHT_BATTERY"), 100)
         dev = backlight_device(self.conf)
-        if not prev or not pct.isdigit() or not dev:
+        if not prev or pct is None or not dev:
             return
         base = os.path.join(SYSROOT, "class", "backlight", dev)
         cur, top = read_int_file(os.path.join(base, "brightness")), read_int_file(os.path.join(base, "max_brightness"))
@@ -1113,9 +1403,9 @@ class Bridge:
             log(f"no backlight {dev}")
             return
         if prev == "ac" and cls != "ac":
-            if cur * 100 // top > int(pct):
+            if cur * 100 // top > pct:
                 state_write(SAVED_NAME, str(cur))
-                self.set_backlight(dev, top * int(pct) // 100)
+                self.set_backlight(dev, top * pct // 100)
         elif prev != "ac" and cls == "ac":
             want = state_int(SAVED_NAME)
             state_remove(SAVED_NAME)
@@ -1147,7 +1437,7 @@ class Bridge:
         path, iface, prop = self.overdrive
         try:
             cur = self.raw_prop(path, iface, prop)
-            if int(cur.unpack()) != value:
+            if dbus_int(cur, 0, 1) != value:
                 self.set_prop(path, iface, prop, GLib.Variant(cur.get_type_string(), value))
         except GLib.Error as e:
             log(f"panel overdrive {value}: {e.message}")
@@ -1171,23 +1461,42 @@ class Bridge:
         mons = self.hypr.monitors() if self.hypr.available else []
         m = self.find_output(mons)
         self.output = m["name"] if m and re.fullmatch(r"[A-Za-z0-9-]+", str(m.get("name", ""))) else ""
-        self.refresh_hz = int(round(float(m.get("refreshRate", 0)))) if m and self.output else 0
+        hz = number(m.get("refreshRate"), 1, 1000) if m and self.output else None
+        self.refresh_hz = int(round(hz)) if hz else 0
         return m
 
     def apply_refresh(self):
         m = self.read_monitors()
         hz = self.target_hz()
-        if not m or not self.output or not hz or hz == self.refresh_hz:
+        if not m or not self.output:
             return
-        depth = self.conf.get("BITDEPTH", "")
-        if not depth.isdigit():
-            depth = "10" if "2101010" in str(m.get("currentFormat", "")) else "8"
+        # With a panel rule in monitors.lua, set only the mode (and BITDEPTH
+        # if set): Hyprland merges it into that rule, field by field, both
+        # now and from the generated rule on every reload. The reloaded rule
+        # then matches the active one and the panel isn't modeset again (an
+        # explicit scale or bit depth the user's rule doesn't carry would
+        # differ, and both are modeset properties). Without one, a new rule
+        # for the panel would drop the catch-all's scale, so it stays as
+        # before: the whole live mode now, set again after each reload.
+        own = panel_rule_in_monitors_lua(self.output)
+        depth = digits(self.conf.get("BITDEPTH"), 16)
         try:
-            scale = round(float(m.get("scale", 1)), 6)
-            lua = ('hl.monitor({ output = "%s", mode = "%dx%d@%d", position = "%dx%d", scale = %s, bitdepth = %s })'
-                   % (self.output, int(m["width"]), int(m["height"]), hz,
-                      int(m["x"]), int(m["y"]), scale, depth))
-        except (KeyError, TypeError, ValueError):
+            mode = "%dx%d@%d" % (int(m["width"]), int(m["height"]), hz) if hz else ""
+            if own:
+                lua = 'hl.monitor({ output = "%s", mode = "%s"%s })' % (
+                    self.output, mode, ", bitdepth = %d" % depth if depth is not None else "")
+            else:
+                if depth is None:
+                    depth = 10 if "2101010" in str(m.get("currentFormat", "")) else 8
+                lua = ('hl.monitor({ output = "%s", mode = "%s", position = "%dx%d", scale = %s, bitdepth = %d })'
+                       % (self.output, mode, int(m["x"]), int(m["y"]),
+                          round(float(number(m.get("scale", 1), 0.1, 16)), 6), depth))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return
+        write_rate_rule("-- Written by the omarchy-asus plugin, rewritten as the power source changes:\n"
+                        "-- the internal panel's refresh rate, so a Hyprland reload keeps it.\n"
+                        + lua + "\n" if own and hz else None)
+        if not hz or hz == self.refresh_hz:
             return
         prev = self.refresh_hz
         log(f"{self.output} {prev}Hz -> {hz}Hz")
@@ -1345,14 +1654,17 @@ class Bridge:
             if cmd == "slash-enabled":
                 prop, raw = "Enabled", a[0] == "true"
             elif cmd == "slash-brightness":
-                prop, raw = "Brightness", max(0, min(255, int(a[0])))
+                raw = digits(a[0])
+                if raw is None:
+                    raise ValueError(f"bad slash brightness: {a[0]}")
+                prop, raw = "Brightness", min(255, raw)
             elif cmd == "slash-flag":
                 if a[0] not in SLASH_FLAGS:
                     raise ValueError(f"bad slash flag: {a[0]}")
                 prop, raw = a[0], a[1] == "true"
             else:
-                prop, raw = "Interval", int(a[0])
-                if not 0 <= raw < len(SLASH_MODES):
+                prop, raw = "Interval", digits(a[0])
+                if raw is None or raw >= len(SLASH_MODES):
                     raise ValueError(f"bad slash pattern: {a[0]}")
             v = self.raw_prop(self.slash, SLASH, prop)
             self.set_prop(self.slash, SLASH, prop, GLib.Variant(v.get_type_string(), raw))
@@ -1371,12 +1683,20 @@ class Bridge:
             self.apply("gaming")
         elif cmd == "battery-limit":
             self.need(self.charge)
-            n = int(a[0])
-            if not 20 <= n <= 100:
+            n = digits(a[0])
+            if n is None or not 20 <= n <= 100:
                 raise ValueError(f"bad charge limit: {n}")
-            path, iface = self.charge
-            v = self.raw_prop(path, iface, CHARGE_PROP)
-            self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), n))
+            if self.held and n > self.held:
+                # Charging is held: this is the limit that comes back.
+                state_write(HOLD_NAME, str(n))
+            else:
+                if self.held:
+                    # At or below the charge: nothing left to hold.
+                    state_remove(HOLD_NAME)
+                    self.end_hold()
+                path, iface = self.charge
+                v = self.raw_prop(path, iface, CHARGE_PROP)
+                self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), n))
         elif cmd == "winlock-mode":
             self.set_winlock_mode(a[0])
         else:
@@ -1404,18 +1724,23 @@ class Bridge:
             return
         try:
             msg = json.loads(line)
-            cid = int(msg.get("id", 0))
+            cid = number(msg.get("id", 0), 0, 2 ** 53)
+            if cid is None:
+                raise ValueError("id must be a number")
+            cid = int(cid)
             cmd = str(msg.get("cmd", ""))
             args = msg.get("args", [])
             if not isinstance(args, list):
                 raise ValueError("args must be a list")
-        except (ValueError, AttributeError) as e:
+        except (ValueError, AttributeError, TypeError) as e:
             self.send({"type": "reply", "id": 0, "ok": False, "error": f"bad request: {e}"})
             return
         try:
             self.command(cmd, args)
             ok, err = True, ""
-        except (ValueError, IndexError, GLib.Error, OSError) as e:
+        except Exception as e:
+            # Anything that escapes here would also escape the stdin watch,
+            # which GLib then drops: the bridge would stop taking commands.
             ok, err = False, getattr(e, "message", None) or str(e)
             log(f"{cmd} {args}: {err}")
         self.ack = max(self.ack, cid)
@@ -1454,7 +1779,14 @@ class Bridge:
                           GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
                           self.stdin_readable)
         self.emit()
-        self.loop.run()
+        try:
+            self.loop.run()
+        finally:
+            # Stopped (the shell stopped the service, or the plugin was
+            # removed): put back a held charge limit, and leave no rate rule
+            # behind to pin the panel without us. Each runs even if the other
+            # fails.
+            each("bridge stopping", lambda: self.release_hold("bridge stopping"), lambda: write_rate_rule(None))
 
 
 def cli(argv):
@@ -1470,12 +1802,14 @@ def cli(argv):
         print("hz override:", pin if pin else "auto")
     elif argv[0] == "release":
         # Before removing the plugin: turn off every fan curve and PPT tuning
-        # group the bridge turned on, so no power limit outlives it.
+        # group the bridge turned on, so no power limit outlives it, and put
+        # back a charge limit a hold left behind.
         b = Bridge()
         b.read_on_battery()
         b.discover()
         b.conf, b.limits_on = {}, True
-        b.apply_limits("release")
+        each("release", lambda: b.apply_limits("release"), lambda: b.restore_limit("release"),
+             lambda: write_rate_rule(None))
         left = b.read_groups()
         if left:
             print("still on (for another power state or profile; inert while their fan curve is off):",
