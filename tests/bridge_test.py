@@ -864,10 +864,55 @@ class BridgeTest(unittest.TestCase):
         h.send("get")                     # a re-read sees the panel again (at its current 60 Hz)
         h.wait(lambda: h.state.get("hasPanel") and h.state.get("refreshHz") == 60, what="normal again")
 
+    def test_numbers_out_of_range_from_dbus_and_hyprland_are_ignored(self):
+        # A charge that isn't a number in 0..100, a limit that isn't a number,
+        # a refresh rate that isn't finite: each is ignored, and the bridge
+        # keeps answering (an exception in a callback used to drop the stdin
+        # watch, or the hold, with a traceback).
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("chargeLimit") == 80, what="barrel")
+        h.battery("Percentage", "d", float("nan"))
+        h.flap()
+        h.wait(lambda: h.state.get("source") == "weak", what="weak barrel")
+        self.assertEqual((h.charge_sets(), h.state["chargeHeld"]), ([], 0), "no hold from a NaN charge")
+        h.battery("Percentage", "d", 50.0)
+        h.flap(1)
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.battery("Percentage", "d", float("-inf"))
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "ChargeControlEndThreshold", "s", "lots"]})
+        h.hypr.hz = float("inf")
+        self.assertTrue(h.send("get")["ok"])
+        self.assertEqual((h.state["chargeHeld"], h.state["chargeLimit"], h.state["refreshHz"]), (50, 80, 0))
+        self.assertTrue(h.send("battery-limit", "100")["ok"], "still taking commands")
+        h.err.flush()
+        self.assertNotIn("Traceback", h.stderr())
+        self.assertNotIn("uncaught", h.stderr())
+
+    def test_an_uncaught_exception_is_one_bounded_log_line(self):
+        r = subprocess.run([sys.executable, "-I", "-B", "-c",
+                            "import importlib.util as u, sys; s = u.spec_from_file_location('b', sys.argv[1]); "
+                            "s.loader.exec_module(u.module_from_spec(s)); "
+                            "raise ValueError('x' * 100000 + '\\n' + 'y' * 100000)", BRIDGE],
+                           capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(len(r.stderr.splitlines()), 1, r.stderr[:500])
+        self.assertTrue(r.stderr.startswith("omarchy-asus: uncaught ValueError: xxx"), r.stderr[:500])
+        self.assertLess(len(r.stderr), 400)
+
     def test_overlong_settings_values_are_ignored(self):
         h = self.harness(conf=CONF.replace("KBD_AC=med", "KBD_AC=" + "m" * 1000))
         h.wait(lambda: h.state.get("hasAura"), what="started")
         self.assertEqual(h.state["kbdAC"], "")
+
+    def test_settings_values_are_ascii(self):
+        # "²".isdigit() is true and int("²") fails: only ASCII values are read.
+        h = self.harness(conf=CONF.replace("HZ_GAMING=165", "HZ_GAMING=²"))
+        h.wait(lambda: h.state.get("hasAura") and h.state.get("refreshHz") == 240, what="started")
+        evals = len(h.hypr.evals)
+        self.assertTrue(h.send("gaming", "on")["ok"])
+        self.assertEqual(len(h.hypr.evals), evals, "no modeset from a value that isn't a number")
+        h.err.flush()
+        self.assertNotIn("uncaught", h.stderr())
 
     def test_release_turns_everything_off_before_removal(self):
         h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
