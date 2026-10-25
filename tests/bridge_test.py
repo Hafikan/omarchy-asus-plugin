@@ -826,6 +826,31 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(h.elsewhere, "state", "omarchy")), [],
                          "nothing written below the linked ancestor")
 
+    def test_a_dir_or_file_others_can_write_is_refused(self):
+        # Another user who can write a dir can swap the temporary file before
+        # the rename; one who can write a file can choose what's read.
+        def plant(h):
+            os.makedirs(h.state_dir)
+            pin = os.path.join(h.state_dir, "omarchy-asus-hz")
+            with open(pin, "w") as f:
+                f.write("60\n")
+            os.chmod(pin, 0o666)
+        h = self.harness(before=plant)
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        self.assertEqual(h.state["refreshOverride"], "auto", "a file others can write is not read")
+        self.assertTrue(h.send("refresh", "120")["ok"])
+        pin = os.path.join(h.state_dir, "omarchy-asus-hz")
+        self.assertEqual((h.state_file("omarchy-asus-hz"), oct(os.stat(pin).st_mode & 0o7777)), ("120", "0o644"),
+                         "replaced, and nobody else can write the new file")
+        self.assertEqual(h.state["refreshOverride"], "120")
+        os.chmod(h.state_dir, 0o777)
+        before = sorted(os.listdir(h.state_dir))
+        r = h.send("refresh", "90")
+        self.assertFalse(r["ok"])
+        self.assertIn("writable by group or others", r["error"])
+        self.assertEqual(h.state_file("omarchy-asus-hz"), "120")
+        self.assertEqual(sorted(os.listdir(h.state_dir)), before, "nothing written in a dir others can write")
+
     def test_files_under_their_old_names_are_renamed_once(self):
         def old(h):
             os.makedirs(os.path.dirname(h.conf))
@@ -914,6 +939,30 @@ class BridgeTest(unittest.TestCase):
         h.err.flush()
         self.assertNotIn("uncaught", h.stderr())
 
+    def test_non_ascii_digits_in_state_files_are_ignored(self):
+        # "ac ²" used to raise out of apply_limits and stop the bridge at start.
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2,
+                         state_files={"omarchy-asus-ppt-groups": "ac ²\n", "omarchy-asus-ppt-curves": "² 1\n"})
+        h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits")
+        self.assertEqual(h.curve_calls(), [[1, "CPU", False], [0, "CPU", True]], "only the ASCII entry read")
+        self.assertTrue(h.send("get")["ok"])
+        self.assertEqual(h.bridge.poll(), None)
+        self.assertNotIn("uncaught", h.stderr())
+
+    def test_a_value_asusd_mangles_does_not_stop_the_cleanup(self):
+        # A charge limit that isn't a number when the bridge stops: the limit
+        # can't be put back, but the refresh-rate rule is still removed.
+        h = self.harness(conf=HOLD, charge_mode=1, before=self.panel_rule)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("chargeLimit") == 80
+               and self.rate_rule(h), what="barrel and rate rule")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "ChargeControlEndThreshold", "s", "lots"]})
+        h.bridge.stdin.close()
+        self.assertEqual(h.bridge.wait(5), 0, h.stderr()[-500:])
+        self.assertIsNone(self.rate_rule(h), "no rule outlives the bridge")
+        self.assertEqual(h.state_file(HELD), "80", "kept, so the next start puts it back")
+
     def test_release_turns_everything_off_before_removal(self):
         h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
         h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits")
@@ -933,6 +982,8 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: h.state.get("hasAura"), what="started")
         for bad in ({"id": None, "cmd": "get"}, {"id": [1], "cmd": "get"}, ["get"]):
             h.bridge.stdin.write(json.dumps(bad) + "\n")
+        for bad in ('{"id": Infinity, "cmd": "get"}', '{"id": NaN, "cmd": "get"}', '{"id": "²", "cmd": "get"}'):
+            h.bridge.stdin.write(bad + "\n")
         h.bridge.stdin.flush()
         self.assertTrue(h.send("get")["ok"], "the bridge still answers after bad requests")
 

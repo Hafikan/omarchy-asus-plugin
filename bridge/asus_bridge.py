@@ -211,6 +211,32 @@ def number(v, lo, hi):
     return v
 
 
+def dbus_int(variant, lo, hi):
+    """A D-Bus property's value as an int in [lo, hi], else None."""
+    v = number(variant.unpack(), lo, hi)
+    return None if v is None else int(v)
+
+
+def digits(s, hi=999999999):
+    """s as an int when it is 1-9 ASCII digits and at most hi, else None.
+    Files and settings are parsed with this, never isdigit(): "²".isdigit()
+    is true and int("²") fails."""
+    if not isinstance(s, str) or not re.fullmatch(r"[0-9]{1,9}", s):
+        return None
+    v = int(s)
+    return v if v <= hi else None
+
+
+def each(why, *steps):
+    """Run every step, each on its own: one that fails is logged and the
+    next still runs (cleanup when the bridge stops, and `release`)."""
+    for step in steps:
+        try:
+            step()
+        except Exception as e:
+            log(f"{why}: {type(e).__name__}: {getattr(e, 'message', None) or e}")
+
+
 # ------------------------------------------------------------------ safe files
 # Every file this bridge writes is in the user's own XDG config or state dir.
 # A planted symbolic link must never redirect a write:
@@ -219,11 +245,16 @@ def number(v, lo, hi):
 #     is refused, and each step must be ours or a root-owned system dir;
 #   - each dir below it is opened (or created) relative to that descriptor
 #     with O_NOFOLLOW, and must be owned by us too;
-#   - a write goes to a new private temporary file (O_CREAT|O_EXCL|O_NOFOLLOW,
-#     random name) in that dir, is fsynced and renamed over the target; a
-#     target that is a symbolic link is refused, not followed;
+#   - no dir of ours on the way is writable by group or others: nobody else
+#     can rename an entry in it, so a temporary file can't be swapped for
+#     another before the rename;
+#   - a write goes to a new 0600 temporary file (O_CREAT|O_EXCL|O_NOFOLLOW,
+#     random name) in that dir, is given its final mode on its descriptor,
+#     fsynced and renamed over the target; a target that is a symbolic link
+#     is refused, not followed;
 #   - reads are opened with O_NOFOLLOW, descriptor-checked (a regular file of
-#     ours) and size-capped; a symbolic link is not read, and says so.
+#     ours that nobody else can write) and size-capped; a symbolic link is not
+#     read, and says so.
 UID = os.getuid()
 O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 MAX_FILE = 64 * 1024
@@ -238,6 +269,8 @@ def _check_owner(fd, what):
     st = os.fstat(fd)
     if st.st_uid != UID:
         raise UnsafePath(f"{what} is not owned by this user")
+    if st.st_mode & 0o022:
+        raise UnsafePath(f"{what} is writable by group or others")
     return st
 
 
@@ -274,6 +307,8 @@ class Dir:
                 fd = nfd
                 st = os.fstat(fd)
                 mine = st.st_uid == UID
+                if mine and st.st_mode & 0o022:
+                    raise UnsafePath(f"{base}: {part} is writable by group or others")
                 if not mine and (st.st_uid != 0 or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX)):
                     raise UnsafePath(f"{base}: {part} is neither ours nor a safe system directory")
             _check_owner(fd, base)
@@ -300,7 +335,8 @@ class Dir:
 
     def read(self, name):
         """The file's text, or None if it's missing, a symbolic link, not a
-        regular file of ours, or larger than MAX_FILE."""
+        regular file of ours, writable by group or others, or larger than
+        MAX_FILE."""
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
         try:
             fd = os.open(name, flags, dir_fd=self.fd)
@@ -311,6 +347,9 @@ class Dir:
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_uid != UID:
+                return None
+            if st.st_mode & 0o022:
+                log(f"{name} is writable by group or others; not read")
                 return None
             data = os.read(fd, MAX_FILE + 1)
             if len(data) > MAX_FILE:
@@ -341,13 +380,17 @@ class Dir:
             mode = stat.S_IMODE(st.st_mode)
         except FileNotFoundError:
             pass
+        # The user's own read bits carry over; never a write bit for anyone
+        # else, nor setuid/setgid/sticky.
+        mode &= 0o755
         tmp = f".{name}.{secrets.token_hex(6)}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                     mode, dir_fd=self.fd)
+                     0o600, dir_fd=self.fd)
         try:
             data = text.encode("utf-8")
             while data:
                 data = data[os.write(fd, data):]
+            os.fchmod(fd, mode)
             os.fsync(fd)
             os.close(fd)
             fd = -1
@@ -450,7 +493,7 @@ def state_int(name):
 def read_conf():
     """KEY=VALUE lines; quotes stripped; anything else ignored (never sourced).
     Values are short printable ASCII tokens: anything else, or longer than 64
-    characters, is dropped (so isdigit() means 0-9 wherever a value is used)."""
+    characters, is dropped; numbers in them are read with digits()."""
     out = {}
     try:
         with config_dir(create=False) as d:
@@ -1053,10 +1096,9 @@ class Bridge:
         pin = pinned_hz()
         if pin:
             return pin
-        if gaming_on() and self.conf.get("HZ_GAMING", "").isdigit():
-            return int(self.conf["HZ_GAMING"])
-        v = self.conf.get("HZ_" + self.source(), "")
-        return int(v) if v.isdigit() else None
+        if gaming_on() and digits(self.conf.get("HZ_GAMING"), 1000):
+            return digits(self.conf["HZ_GAMING"])
+        return digits(self.conf.get("HZ_" + self.source()), 1000) or None
 
     def apply(self, why, refresh_only=False):
         """Apply the settings for the current power source. Keys that are not
@@ -1084,16 +1126,12 @@ class Bridge:
         key = {"ac": "AC", "weak": "WEAK_BARREL", "usbc": "USBC"}.get(self.kind)
         if not key:
             return None, None
-        ppt = self.conf.get("PPT_" + key, "").split()
-        ppt = [int(x) for x in ppt] if len(ppt) == 3 and all(x.isdigit() for x in ppt) else None
-        b = self.conf.get("BOOST_" + key, "")
-        return ppt, (int(b) if b.isdigit() else None)
+        ppt = [digits(x) for x in self.conf.get("PPT_" + key, "").split()]
+        ppt = ppt if len(ppt) == 3 and None not in ppt else None
+        return ppt, digits(self.conf.get("BOOST_" + key))
 
     def read_curves(self):
-        try:
-            return [int(x) for x in state_read(CURVES_NAME).split()[:8] if x.isdigit()]
-        except ValueError:
-            return []
+        return [v for v in (digits(x, 255) for x in state_read(CURVES_NAME).split()[:8]) if v is not None]
 
     def set_curve(self, profile, on):
         # Only the CPU fan's curve gates the PPT; asusd persists the flag per
@@ -1124,16 +1162,24 @@ class Bridge:
                 pass
         if "CurrentValue" not in props:
             return
-        lo, hi = (int(props[p].unpack()) if p in props else -1 for p in ("MinValue", "MaxValue"))
+        # Every value asusd reports is checked: anything but a number in range
+        # reads as missing (-1, asusd's own "none"), and a current value that
+        # isn't one is left alone.
+        lo, hi, dflt, cur = (dbus_int(props[p], -1, 1000000) if p in props else None
+                             for p in ("MinValue", "MaxValue", "DefaultValue", "CurrentValue"))
+        lo, hi = (-1 if x is None else x for x in (lo, hi))
+        if cur is None:
+            log(f"{name}: asusd reported no usable current value")
+            return
         if default:
-            value = int(props["DefaultValue"].unpack()) if "DefaultValue" in props else -1
-            if value < 0:
+            if dflt is None or dflt < 0:
                 return
+            value = dflt
         if 0 <= lo <= hi and hi > 0:
             value = max(lo, min(hi, value))
         elif hi == 0 and value != 0:
             return                      # not adjustable on this source (e.g. boost on battery)
-        if int(props["CurrentValue"].unpack()) != value:
+        if cur != value:
             self.set_prop(path, iface, "CurrentValue",
                           GLib.Variant(props["CurrentValue"].get_type_string(), value))
             log(f"{name} -> {value}")
@@ -1142,8 +1188,8 @@ class Bridge:
         out = []
         for line in state_read(GROUPS_NAME).splitlines()[:16]:
             parts = line.split()
-            if len(parts) == 2 and parts[0] in ("ac", "dc") and parts[1].isdigit():
-                out.append((parts[0], int(parts[1])))
+            if len(parts) == 2 and parts[0] in ("ac", "dc") and digits(parts[1], 255) is not None:
+                out.append((parts[0], digits(parts[1])))
         return out
 
     def write_groups(self, groups):
@@ -1174,7 +1220,10 @@ class Bridge:
         ppt, boost = self.wanted_limits()
         try:
             stale = self.read_curves()
-            profile = int(self.raw_prop(self.platform, PLATFORM, "PlatformProfile").unpack())
+            profile = dbus_int(self.raw_prop(self.platform, PLATFORM, "PlatformProfile"), 0, 255)
+            if profile is None:
+                log(f"power limits ({why}): asusd reported no usable platform profile")
+                return
             if ppt is None and boost is None:
                 if self.limits_on or stale or self.read_groups():
                     for p in stale:
@@ -1322,7 +1371,7 @@ class Bridge:
             path, iface = self.charge
             try:
                 v = self.raw_prop(path, iface, CHARGE_PROP)
-                if int(v.unpack()) != saved:
+                if dbus_int(v, 0, 100) != saved:
                     self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), saved))
                 log(f"charging resumed ({why}): limit {saved}%")
             except GLib.Error as e:
@@ -1344,9 +1393,9 @@ class Bridge:
             state_write(SEEN_NAME, cls)
         except OSError as e:
             log(f"cannot record the power source: {e}")
-        pct = self.conf.get("BRIGHT_BATTERY", "")
+        pct = digits(self.conf.get("BRIGHT_BATTERY"), 100)
         dev = backlight_device(self.conf)
-        if not prev or not pct.isdigit() or not dev:
+        if not prev or pct is None or not dev:
             return
         base = os.path.join(SYSROOT, "class", "backlight", dev)
         cur, top = read_int_file(os.path.join(base, "brightness")), read_int_file(os.path.join(base, "max_brightness"))
@@ -1354,9 +1403,9 @@ class Bridge:
             log(f"no backlight {dev}")
             return
         if prev == "ac" and cls != "ac":
-            if cur * 100 // top > int(pct):
+            if cur * 100 // top > pct:
                 state_write(SAVED_NAME, str(cur))
-                self.set_backlight(dev, top * int(pct) // 100)
+                self.set_backlight(dev, top * pct // 100)
         elif prev != "ac" and cls == "ac":
             want = state_int(SAVED_NAME)
             state_remove(SAVED_NAME)
@@ -1388,7 +1437,7 @@ class Bridge:
         path, iface, prop = self.overdrive
         try:
             cur = self.raw_prop(path, iface, prop)
-            if int(cur.unpack()) != value:
+            if dbus_int(cur, 0, 1) != value:
                 self.set_prop(path, iface, prop, GLib.Variant(cur.get_type_string(), value))
         except GLib.Error as e:
             log(f"panel overdrive {value}: {e.message}")
@@ -1430,16 +1479,16 @@ class Bridge:
         # for the panel would drop the catch-all's scale, so it stays as
         # before: the whole live mode now, set again after each reload.
         own = panel_rule_in_monitors_lua(self.output)
-        depth = self.conf.get("BITDEPTH", "")
+        depth = digits(self.conf.get("BITDEPTH"), 16)
         try:
             mode = "%dx%d@%d" % (int(m["width"]), int(m["height"]), hz) if hz else ""
             if own:
                 lua = 'hl.monitor({ output = "%s", mode = "%s"%s })' % (
-                    self.output, mode, ", bitdepth = %s" % depth if depth.isdigit() else "")
+                    self.output, mode, ", bitdepth = %d" % depth if depth is not None else "")
             else:
-                if not depth.isdigit():
-                    depth = "10" if "2101010" in str(m.get("currentFormat", "")) else "8"
-                lua = ('hl.monitor({ output = "%s", mode = "%s", position = "%dx%d", scale = %s, bitdepth = %s })'
+                if depth is None:
+                    depth = 10 if "2101010" in str(m.get("currentFormat", "")) else 8
+                lua = ('hl.monitor({ output = "%s", mode = "%s", position = "%dx%d", scale = %s, bitdepth = %d })'
                        % (self.output, mode, int(m["x"]), int(m["y"]),
                           round(float(number(m.get("scale", 1), 0.1, 16)), 6), depth))
         except (KeyError, TypeError, ValueError, OverflowError):
@@ -1605,14 +1654,17 @@ class Bridge:
             if cmd == "slash-enabled":
                 prop, raw = "Enabled", a[0] == "true"
             elif cmd == "slash-brightness":
-                prop, raw = "Brightness", max(0, min(255, int(a[0])))
+                raw = digits(a[0])
+                if raw is None:
+                    raise ValueError(f"bad slash brightness: {a[0]}")
+                prop, raw = "Brightness", min(255, raw)
             elif cmd == "slash-flag":
                 if a[0] not in SLASH_FLAGS:
                     raise ValueError(f"bad slash flag: {a[0]}")
                 prop, raw = a[0], a[1] == "true"
             else:
-                prop, raw = "Interval", int(a[0])
-                if not 0 <= raw < len(SLASH_MODES):
+                prop, raw = "Interval", digits(a[0])
+                if raw is None or raw >= len(SLASH_MODES):
                     raise ValueError(f"bad slash pattern: {a[0]}")
             v = self.raw_prop(self.slash, SLASH, prop)
             self.set_prop(self.slash, SLASH, prop, GLib.Variant(v.get_type_string(), raw))
@@ -1631,8 +1683,8 @@ class Bridge:
             self.apply("gaming")
         elif cmd == "battery-limit":
             self.need(self.charge)
-            n = int(a[0])
-            if not 20 <= n <= 100:
+            n = digits(a[0])
+            if n is None or not 20 <= n <= 100:
                 raise ValueError(f"bad charge limit: {n}")
             if self.held and n > self.held:
                 # Charging is held: this is the limit that comes back.
@@ -1672,7 +1724,10 @@ class Bridge:
             return
         try:
             msg = json.loads(line)
-            cid = int(msg.get("id", 0))
+            cid = number(msg.get("id", 0), 0, 2 ** 53)
+            if cid is None:
+                raise ValueError("id must be a number")
+            cid = int(cid)
             cmd = str(msg.get("cmd", ""))
             args = msg.get("args", [])
             if not isinstance(args, list):
@@ -1724,11 +1779,14 @@ class Bridge:
                           GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
                           self.stdin_readable)
         self.emit()
-        self.loop.run()
-        self.release_hold("bridge stopping")
-        # Stopped (the shell stopped the service, or the plugin was removed):
-        # leave no rate rule behind to pin the panel without us.
-        write_rate_rule(None)
+        try:
+            self.loop.run()
+        finally:
+            # Stopped (the shell stopped the service, or the plugin was
+            # removed): put back a held charge limit, and leave no rate rule
+            # behind to pin the panel without us. Each runs even if the other
+            # fails.
+            each("bridge stopping", lambda: self.release_hold("bridge stopping"), lambda: write_rate_rule(None))
 
 
 def cli(argv):
@@ -1750,9 +1808,8 @@ def cli(argv):
         b.read_on_battery()
         b.discover()
         b.conf, b.limits_on = {}, True
-        b.apply_limits("release")
-        b.restore_limit("release")
-        write_rate_rule(None)
+        each("release", lambda: b.apply_limits("release"), lambda: b.restore_limit("release"),
+             lambda: write_rate_rule(None))
         left = b.read_groups()
         if left:
             print("still on (for another power state or profile; inert while their fan curve is off):",

@@ -51,8 +51,9 @@ omarchy-plugin-remove io.github.omarchy-asus.panel
 - **Hyprland's IPC sockets:** the monitor list, `hl.monitor()` for the internal panel's refresh rate, and hotplug/reload events.
 - **Files:** it reads and writes only `~/.config/omarchy/omarchy-asus.conf`, `~/.local/state/omarchy/` and the Win-lock drop-in above, and reads `~/.config/hypr/monitors.lua`.
   - In `~/.local/state/omarchy/toggles/hypr/` it keeps one file, `omarchy-asus-refresh.lua`: the panel's refresh rate as an `hl.monitor()` line that Omarchy loads on every Hyprland reload. Only while the bridge runs, a rate is set and `monitors.lua` has a rule for the panel; the bridge removes it when it stops.
-  - Directories are walked from `/` one component at a time without following symbolic links; each must be yours or a root-owned system directory.
-  - Writes go to a new private temporary file that is atomically renamed into place.
+  - Directories are walked from `/` one component at a time without following symbolic links; each must be yours or a root-owned system directory, and none of yours may be writable by your group or others.
+  - Writes go to a new private (`0600`) temporary file that is atomically renamed into place. A file is never left writable by anyone but you.
+  - A file your group or others can write is not read (the log says so).
   - A symbolic link is never read or written through: keep a real `omarchy-asus.conf` (copy it from your dotfiles), and the log says so if it is a link.
 - **Nothing runs as root,** and the plugin installs nothing system-wide.
 
