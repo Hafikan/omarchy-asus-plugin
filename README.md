@@ -99,14 +99,19 @@ minutes; if the barrel drops out again it holds again and waits twice as long
 next time (up to 30 minutes). Unplugging or removing the key puts your limit
 back; a limit set elsewhere (`asusctl battery limit`) replaces it and ends the
 hold. A limit picked in the panel while charging is held is the one that comes
-back.
+back. Your limit stays saved until asusd has actually taken it back: if asusd
+refuses, charging stays held and the widget tries again after the next quiet
+spell.
 
 **Power limits and the fan curve.** On the GA605KM (BIOS 307) the firmware only
 applies PPT limits while the CPU custom fan curve is on; in auto fan mode a
 written limit is stored but ignored. So on a source with limits the widget
 enables asusd's stored CPU curve for the current profile, then writes the
 limits; leaving it turns the curve off and writes the defaults back. The fans
-follow that curve while limits apply. The values the G16 used with rog-power:
+follow that curve while limits apply. Each curve and tuning group the widget
+turns on is recorded in `~/.local/state/omarchy` before it's turned on, so a
+crash or a full disk never leaves one on that `release` can't find; if the
+record can't be written, nothing is turned on. The values the G16 used with rog-power:
 `PPT_USBC="25 30 40"`, `PPT_WEAK_BARREL="45 55 65"`, `BOOST_WEAK_BARREL=5`
 (the OEM barrel left at stock).
 
