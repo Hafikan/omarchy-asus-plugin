@@ -10,6 +10,10 @@ appended to $FAKE_LOG as a JSON line. Commands arrive on stdin as JSON lines:
   {"asusd": false}                                 drop the asusd name (true: own it again)
   {"noise": true}                                  start unrelated PropertiesChanged traffic (NetworkManager,
                                                    UPower's battery device), as on a real system bus
+  {"refuse": [name, ...]}                          fail every Set of these properties and every call of these
+                                                   methods, as asusd or logind do when the write fails
+                                                   ([] accepts them again)
+FAKE_REFUSE=prop,... refuses those Sets from the start.
 FAKE_SLASH_GETALL_FAILS=1 makes GetAll on the Slash interface fail, the way asusd's
 zbus fails the whole call when one getter errors.
 Prints "ready" once every name is owned.
@@ -300,6 +304,26 @@ if os.environ.get("FAKE_SLASH_GETALL_FAILS") == "1":
         return msg
     system.add_filter(getall_filter)
 
+refusing = set(p for p in os.environ.get("FAKE_REFUSE", "").split(",") if p)
+
+
+def refuse_filter(conn, msg, incoming):
+    if not (incoming and refusing and msg.get_message_type() == Gio.DBusMessageType.METHOD_CALL):
+        return msg
+    name = msg.get_member()
+    if msg.get_interface() == "org.freedesktop.DBus.Properties" and name == "Set" and msg.get_body():
+        name = msg.get_body().unpack()[1]
+    if name in refusing:
+        log({"refused-call": name})
+        conn.send_message(Gio.DBusMessage.new_method_error_literal(
+            msg, "org.freedesktop.zbus.Error", "the firmware refused the write"), Gio.DBusSendMessageFlags.NONE)
+        return None
+    return msg
+
+
+system.add_filter(refuse_filter)
+upower.add_filter(refuse_filter)
+
 own(upower, "org.freedesktop.UPower")
 own(upower, "org.freedesktop.login1")
 own(session, "org.freedesktop.systemd1")
@@ -340,6 +364,9 @@ def stdin_cb(fd, cond):
                 if not groups.get((plugged(), profile()), False):
                     reset_ppt(system)     # the firmware's limits for the new source
             changed(upower if path.startswith("/org/freedesktop/UPower") else system, path, iface, prop)
+        elif "refuse" in msg:
+            refusing.clear()
+            refusing.update(msg["refuse"])
         elif "noise" in msg:
             nm = Gio.DBusConnection.new_for_address_sync(
                 os.environ["DBUS_SYSTEM_BUS_ADDRESS"],

@@ -1290,7 +1290,11 @@ class Bridge:
         if self.held:
             self.start_quiet()
             return
-        pct, limit = self.battery_percent(), self.user_limit()
+        # A limit saved by a hold whose restore failed is still the user's:
+        # it's the one that comes back, never the ceiling asusd shows now.
+        saved = state_int(HOLD_NAME)
+        pending = saved is not None and CHARGE_FLOOR <= saved <= 100
+        pct, limit = self.battery_percent(), saved if pending else self.user_limit()
         if pct is None or not limit:
             return
         ceiling = max(CHARGE_FLOOR, int(pct))
@@ -1303,13 +1307,15 @@ class Bridge:
         else:
             self.hold_quiet = HOLD_QUIET_S
         try:
-            state_write(HOLD_NAME, str(limit))      # first, so a crash can't lose it
+            if not pending:
+                state_write(HOLD_NAME, str(limit))  # first, so a crash can't lose it
             self.held_writes = set()
             self.set_ceiling(ceiling)
         except (GLib.Error, OSError) as e:
             log(f"charge hold: {getattr(e, 'message', e)}")
             self.held = 0
-            state_remove(HOLD_NAME)
+            if not pending:
+                state_remove(HOLD_NAME)         # ours, and the limit never moved
             return
         # The battery device changes every few seconds: followed only while held.
         self.battery_sub = self.system.signal_subscribe(UPOWER, PROPS, "PropertiesChanged", self.battery,
@@ -1343,12 +1349,18 @@ class Bridge:
                 log(f"charge hold: {e.message}")
             self.emit()
 
-    def release_hold(self, why):
-        """Put the user's limit back and stop following the battery."""
+    def release_hold(self, why, final=False):
+        """Put the user's limit back, then stop following the battery. The
+        hold ends only once the limit is back: if asusd refuses, it stays
+        held (and saved) and tries again after the next quiet spell. When
+        the bridge stops (final), the saved limit stays on disk for the next
+        start."""
         if not self.held:
             return
-        self.end_hold()
-        self.restore_limit(why)
+        if self.restore_limit(why) or final:
+            self.end_hold()
+        else:
+            self.start_quiet()
 
     def end_hold(self):
         if self.hold_timer:
@@ -1363,10 +1375,13 @@ class Bridge:
 
     def restore_limit(self, why):
         """Put back the limit a hold saved: this one's, or one a crash or
-        asusd leaving cut short. Kept on disk until it's back."""
+        asusd leaving cut short. Kept on disk until it's back. True when
+        nothing is left to put back."""
         saved = state_int(HOLD_NAME)
-        if saved is None or not self.charge:
-            return
+        if saved is None:
+            return True
+        if not self.charge:
+            return False
         if CHARGE_FLOOR <= saved <= 100:
             path, iface = self.charge
             try:
@@ -1376,8 +1391,9 @@ class Bridge:
                 log(f"charging resumed ({why}): limit {saved}%")
             except GLib.Error as e:
                 log(f"charge limit {saved}: {e.message}")
-                return
+                return False
         state_remove(HOLD_NAME)
+        return True
 
     def adjust_brightness(self):
         """The backlight step, edge-triggered on the source class
@@ -1407,10 +1423,11 @@ class Bridge:
                 state_write(SAVED_NAME, str(cur))
                 self.set_backlight(dev, top * pct // 100)
         elif prev != "ac" and cls == "ac":
+            # Kept until logind has set it: a refused write leaves it for
+            # the next return to the barrel.
             want = state_int(SAVED_NAME)
-            state_remove(SAVED_NAME)
-            if want is not None and cur < want:
-                self.set_backlight(dev, want)
+            if want is None or cur >= want or self.set_backlight(dev, want):
+                state_remove(SAVED_NAME)
 
     def set_backlight(self, dev, value):
         # logind lets the session's user set it; no root, no brightnessctl.
@@ -1419,8 +1436,10 @@ class Bridge:
                       LOGIND + ".Session", "SetBrightness",
                       GLib.Variant("(ssu)", ("backlight", dev, int(value))))
             log(f"backlight {dev} -> {value}")
+            return True
         except GLib.Error as e:
             log(f"backlight {dev}: {e.message}")
+            return False
 
     def set_level_now(self, level):
         cur = self.cache.get((self.aura, AURA), {}).get("Brightness")
@@ -1690,13 +1709,14 @@ class Bridge:
                 # Charging is held: this is the limit that comes back.
                 state_write(HOLD_NAME, str(n))
             else:
-                if self.held:
-                    # At or below the charge: nothing left to hold.
-                    state_remove(HOLD_NAME)
-                    self.end_hold()
+                # At or below the charge, or not held: the user's choice
+                # replaces a saved limit, but only once asusd has taken it.
                 path, iface = self.charge
                 v = self.raw_prop(path, iface, CHARGE_PROP)
                 self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), n))
+                state_remove(HOLD_NAME)
+                if self.held:
+                    self.end_hold()
         elif cmd == "winlock-mode":
             self.set_winlock_mode(a[0])
         else:
@@ -1786,7 +1806,8 @@ class Bridge:
             # removed): put back a held charge limit, and leave no rate rule
             # behind to pin the panel without us. Each runs even if the other
             # fails.
-            each("bridge stopping", lambda: self.release_hold("bridge stopping"), lambda: write_rate_rule(None))
+            each("bridge stopping", lambda: self.release_hold("bridge stopping", final=True),
+                 lambda: write_rate_rule(None))
 
 
 def cli(argv):

@@ -115,7 +115,7 @@ class FakeHyprland:
 class Harness:
     def __init__(self, conf=CONF, asusd=True, on_battery=False, charge_mode=None, bright=None,
                  slash_getall_fails=False, state_files=None, before=None, giant_hyprland=False,
-                 hold_quiet=None):
+                 hold_quiet=None, refuse=()):
         self.tmp = tempfile.mkdtemp(prefix="g16b-")
         t = self.tmp
         self.home = os.path.join(t, "home")
@@ -168,7 +168,7 @@ class Harness:
         base = {"PATH": "/usr/bin:/bin", "HOME": self.home, "LANG": "C.UTF-8",
                 "DBUS_SYSTEM_BUS_ADDRESS": self.sysbus, "DBUS_SESSION_BUS_ADDRESS": self.sesbus}
         fenv = dict(base, FAKE_LOG=self.log, FAKE_NO_ASUSD="0" if asusd else "1", FAKE_SYSFS=self.sys,
-                    FAKE_SLASH_GETALL_FAILS="1" if slash_getall_fails else "0")
+                    FAKE_SLASH_GETALL_FAILS="1" if slash_getall_fails else "0", FAKE_REFUSE=",".join(refuse))
         self.fakes = subprocess.Popen([sys.executable, "-I", FAKES], env=fenv, stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, text=True)
         assert self.fakes.stdout.readline().strip() == "ready"
@@ -560,6 +560,22 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(calls, [["backlight", "amdgpu_bl1", 30], ["backlight", "amdgpu_bl1", 80],
                                  ["backlight", "amdgpu_bl1", 30]])
 
+    def test_a_refused_barrel_level_is_kept_for_the_next_return(self):
+        h = self.harness(conf=CONF + "BRIGHT_BATTERY=30\n", charge_mode=1, bright=80)
+        h.wait(lambda: h.state.get("refreshHz") == 240, what="started on the barrel")
+        h.power(True)
+        h.wait(lambda: h.brightness() == 30, what="dimmed to 30 %")
+        h.fake({"refuse": ["SetBrightness"]})
+        h.power(False)
+        h.wait(lambda: "backlight amdgpu_bl1: " in h.stderr(), what="the barrel level refused")
+        self.assertEqual((h.brightness(), h.state_file("omarchy-asus.bright-ac")), (30, "80"), "kept")
+        h.fake({"refuse": []})
+        h.power(True)
+        h.wait(lambda: h.state.get("source") == "battery", what="on battery")
+        h.power(False)
+        h.wait(lambda: h.brightness() == 80, what="barrel level back")
+        self.assertIsNone(h.state_file("omarchy-asus.bright-ac"))
+
     def test_the_g16s_settings_file_works_as_is(self):
         # The live file from the G16 (tests/g16.conf): a desc: panel
         # match, keys from an older tool (UPOWER_EVENTS, POLL_SECS, HYPR_EVENTS),
@@ -739,6 +755,57 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: h.state.get("chargeLimit") == 100, what="the saved limit back")
         self.assertEqual(h.charge_sets(), [100])
         self.assertIsNone(h.state_file(HELD))
+
+    # A saved limit stays the user's until asusd has taken it back: nothing
+    # drops it, and no ceiling read from asusd meanwhile replaces it.
+    def test_a_refused_restore_keeps_the_hold_and_the_saved_limit(self):
+        h = self.harness(conf=HOLD, charge_mode=1, hold_quiet=3)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("chargeLimit") == 80, what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.fake({"refuse": ["ChargeControlEndThreshold"]})
+        h.wait(lambda: "charge limit 80:" in h.stderr(), timeout=6, what="the restore refused")
+        h.send("get")
+        self.assertEqual((h.state["chargeHeld"], h.state_file(HELD)), (50, "80"), "still held, still saved")
+        h.fake({"refuse": []})
+        h.battery("Percentage", "d", 45.0)          # lower now, and the barrel drops out again
+        h.flap(1)
+        h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=8, what="charging tried again")
+        self.assertEqual(h.charge_sets()[-1], 80, "the user's limit came back, not a ceiling")
+        self.assertIsNone(h.state_file(HELD))
+
+    def test_a_limit_asusd_refused_at_start_is_kept_through_the_next_hold(self):
+        h = self.harness(conf=HOLD, charge_mode=1, hold_quiet=2, asusd=False, state_files={HELD: "80\n"},
+                         refuse=("ChargeControlEndThreshold",))
+        h.wait(lambda: h.state.get("source") == "ac", what="barrel")
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "ChargeControlEndThreshold", "y", 50]})
+        h.fake({"asusd": True})                     # a hold cut short by asusd leaving, then refused back
+        h.wait(lambda: "charge limit 80:" in h.stderr(), what="the restore refused")
+        h.battery("Percentage", "d", 45.0)
+        h.flap()                                    # a hold the firmware refuses
+        h.wait(lambda: "charge hold: " in h.stderr(), what="the hold refused")
+        self.assertEqual(h.state_file(HELD), "80", "a failed hold leaves the saved limit alone")
+        h.fake({"refuse": []})
+        h.flap(1)
+        h.wait(lambda: h.state.get("chargeHeld") == 45, what="held")
+        self.assertEqual(h.state_file(HELD), "80", "the saved limit, not asusd's 50")
+        h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=6, what="charging tried again")
+        self.assertEqual(h.charge_sets(), [45, 80])
+        self.assertIsNone(h.state_file(HELD))
+
+    def test_a_lower_limit_asusd_refuses_keeps_the_hold_and_the_saved_limit(self):
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.fake({"refuse": ["ChargeControlEndThreshold"]})
+        self.assertFalse(h.send("battery-limit", "40")["ok"])
+        h.send("get")
+        self.assertEqual((h.state["chargeHeld"], h.state_file(HELD)), (50, "80"))
+        h.fake({"refuse": []})
+        self.assertTrue(h.send("battery-limit", "40")["ok"])
+        self.assertEqual((h.state["chargeHeld"], h.state_file(HELD)), (0, None), "the user's choice replaces it")
+        self.assertEqual(h.charge_sets(), [50, 40])
 
     def test_profile_change_moves_the_curve(self):
         h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
