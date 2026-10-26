@@ -576,6 +576,24 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: h.brightness() == 80, what="barrel level back")
         self.assertIsNone(h.state_file("omarchy-asus.bright-ac"))
 
+    def test_a_level_waiting_to_go_back_survives_the_next_dimming(self):
+        h = self.harness(conf=CONF + "BRIGHT_BATTERY=30\n", charge_mode=1, bright=80)
+        h.wait(lambda: h.state.get("refreshHz") == 240, what="started on the barrel")
+        h.power(True)
+        h.wait(lambda: h.brightness() == 30, what="dimmed to 30 %")
+        h.fake({"refuse": ["SetBrightness"]})
+        h.power(False)
+        h.wait(lambda: "backlight amdgpu_bl1: " in h.stderr(), what="the barrel level refused")
+        h.fake({"refuse": []})
+        with open(os.path.join(h.backlight, "brightness"), "w") as f:
+            f.write("50\n")                # raised by hand, still dimmer than the saved 80
+        h.power(True)
+        h.wait(lambda: h.brightness() == 30, what="dimmed again")
+        self.assertEqual(h.state_file("omarchy-asus.bright-ac"), "80", "the level waiting to go back is kept")
+        h.power(False)
+        h.wait(lambda: h.brightness() == 80, what="barrel level back")
+        self.assertIsNone(h.state_file("omarchy-asus.bright-ac"))
+
     def test_the_g16s_settings_file_works_as_is(self):
         # The live file from the G16 (tests/g16.conf): a desc: panel
         # match, keys from an older tool (UPOWER_EVENTS, POLL_SECS, HYPR_EVENTS),
@@ -832,6 +850,54 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: h.curve_calls() == [[2, "CPU", False]], what="stale curve off")
         with open(os.path.join(h.state_dir, "omarchy-asus-ppt-curves")) as f:
             self.assertEqual(f.read().strip(), "")
+
+    def test_a_curve_that_cant_be_recorded_is_not_turned_on(self):
+        unwritable = lambda h: os.makedirs(os.path.join(h.state_dir, "omarchy-asus-ppt-curves"))
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2, before=unwritable)
+        h.wait(lambda: "power limits (" in h.stderr(), what="the record refused")
+        h.send("get")
+        self.assertEqual((h.curve_calls(), h.group_sets(), h.ppt_sets()), ([], [], []))
+
+    def test_a_group_that_cant_be_recorded_is_not_turned_on(self):
+        unwritable = lambda h: os.makedirs(os.path.join(h.state_dir, "omarchy-asus-ppt-groups"))
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2, before=unwritable)
+        h.wait(lambda: "power limits (" in h.stderr(), what="the record refused")
+        h.send("get")
+        self.assertEqual((h.curve_calls(), h.group_sets(), h.ppt_sets()), ([[0, "CPU", True]], [], []))
+        self.assertEqual(h.state_file("omarchy-asus-ppt-curves"), "0", "the curve it did turn on is recorded")
+
+    def test_a_curve_recorded_before_a_crash_is_turned_on(self):
+        # The bridge stopped after recording the curve, before asusd took it.
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2,
+                         state_files={"omarchy-asus-ppt-curves": "0\n"})
+        h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits")
+        self.assertEqual(h.curve_calls(), [[0, "CPU", True]])
+        h.power(True)
+        h.wait(lambda: h.curve_calls()[-1:] == [[0, "CPU", False]], what="curve off")
+        self.assertEqual(h.state_file("omarchy-asus-ppt-curves"), "")
+
+    def test_a_group_recorded_but_never_turned_on_is_not_ours(self):
+        # Recorded before a crash, or refused by asusd: either way it reads
+        # off, so a group the user turns on later is theirs.
+        h = self.harness(charge_mode=2, state_files={"omarchy-asus-ppt-groups": "ac 0\n"})
+        h.wait(lambda: h.state_file("omarchy-asus-ppt-groups") == "", what="the record dropped")
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "EnablePptGroup", "b", True]})
+        h.power(True)
+        h.power(False)
+        h.wait(lambda: h.state.get("source") == "usbc", what="USB-C again")
+        h.send("get")
+        self.assertEqual(h.group_sets(), [], "never set by the bridge, on or off")
+
+    def test_a_refused_group_is_not_left_recorded(self):
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2, refuse=("EnablePptGroup",))
+        h.wait(lambda: "power limits (" in h.stderr(), what="the group refused")
+        h.send("get")
+        self.assertEqual((h.state_file("omarchy-asus-ppt-groups") or "", h.ppt_sets()), ("", []))
+        h.fake({"refuse": []})
+        h.power(True)
+        h.power(False)
+        h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits once asusd takes the group")
+        self.assertEqual(h.state_file("omarchy-asus-ppt-groups"), "ac 0")
 
     # ---- the bridge's own file writes: no symlink ever redirects one ----
     def test_a_planted_link_at_a_state_file_is_not_followed(self):

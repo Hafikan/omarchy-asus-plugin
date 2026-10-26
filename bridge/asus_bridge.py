@@ -724,6 +724,7 @@ class Bridge:
         self.platform = None      # path of xyz.ljones.Platform
         self.fancurves = None     # path of xyz.ljones.FanCurves
         self.limits_on = False
+        self.curves_on = set()    # profiles whose curve asusd took this run
         self.line_power = []      # UPower line-power device paths
         self.battery = None       # UPower battery device path
         self.battery_sub = 0      # its PropertiesChanged subscription, only while held
@@ -1135,8 +1136,12 @@ class Bridge:
 
     def set_curve(self, profile, on):
         # Only the CPU fan's curve gates the PPT; asusd persists the flag per
-        # profile, so every one we turn on is recorded until it's off again.
+        # profile, so every one we turn on is recorded, before it's turned on,
+        # until it's off again. A record that can't be written turns nothing on.
         mgr = (self.fancurves, FANCURVES)
+        had = self.read_curves()
+        if on:
+            state_write(CURVES_NAME, " ".join(str(p) for p in sorted(set(had) | {profile})))
         try:
             self.call(self.system, ASUSD, mgr[0], mgr[1], "SetProfileFanCurveEnabled",
                       GLib.Variant("(usb)", (profile, "CPU", on)))
@@ -1144,9 +1149,11 @@ class Bridge:
             log(f"CPU fan curve for profile {profile} -> {on}: {e.message}; trying all fans")
             self.call(self.system, ASUSD, mgr[0], mgr[1], "SetFanCurvesEnabled",
                       GLib.Variant("(ub)", (profile, on)))
-        had = self.read_curves()
-        now = sorted(set(had) | {profile}) if on else [p for p in had if p != profile]
-        state_write(CURVES_NAME, " ".join(str(p) for p in now))
+        if on:
+            self.curves_on.add(profile)
+        else:
+            self.curves_on.discard(profile)
+            state_write(CURVES_NAME, " ".join(str(p) for p in had if p != profile))
 
     def write_attr(self, name, value, default=False):
         """Write an asus-armoury attribute through asusd, clamped to its live
@@ -1202,6 +1209,9 @@ class Bridge:
     def set_group(self, on):
         self.set_prop(self.platform, PLATFORM, "EnablePptGroup", GLib.Variant("b", on))
 
+    def group_on(self):
+        return bool(self.raw_prop(self.platform, PLATFORM, "EnablePptGroup").unpack())
+
     def release_groups(self, profile):
         """Turn off every group we turned on that is current now; the rest wait
         (their curve is off, so their stored limits do nothing meanwhile)."""
@@ -1224,6 +1234,14 @@ class Bridge:
             if profile is None:
                 log(f"power limits ({why}): asusd reported no usable platform profile")
                 return
+            # A recorded group that reads off now was never turned on (the
+            # bridge stopped between recording it and turning it on) or was
+            # turned off since: it isn't ours, so it's dropped from the record.
+            mine = (self.power_state(), profile)
+            groups = self.read_groups()
+            if mine in groups and not self.group_on():
+                groups = [g for g in groups if g != mine]
+                self.write_groups(groups)
             if ppt is None and boost is None:
                 if self.limits_on or stale or self.read_groups():
                     for p in stale:
@@ -1238,14 +1256,22 @@ class Bridge:
             for p in stale:
                 if p != profile:
                     self.set_curve(p, False)
-            if profile not in stale:
+            # A recorded curve not yet turned on this run is turned on again:
+            # the record is written first, so it may never have been.
+            if profile not in stale or profile not in self.curves_on:
                 self.set_curve(profile, True)
-            if not bool(self.raw_prop(self.platform, PLATFORM, "EnablePptGroup").unpack()):
-                # Recorded only when we turn it on: a group the user enabled
-                # themselves is theirs, and we never turn it off.
-                self.set_group(True)
-                self.write_groups(self.read_groups() + [(self.power_state(), profile)])
-                log(f"PPT tuning group {self.power_state()}/{profile} on")
+            if not self.group_on():
+                # Recorded only when we turn it on (a group the user enabled
+                # themselves is theirs, and we never turn it off), and before
+                # we do: a record that can't be written turns nothing on.
+                self.write_groups(groups + [mine])
+                try:
+                    self.set_group(True)
+                except GLib.Error:
+                    if not self.group_on():
+                        self.write_groups(groups)
+                    raise
+                log(f"PPT tuning group {mine[0]}/{mine[1]} on")
             for name, v in zip(PPT_ATTRS, ppt or []):
                 self.write_attr(name, v)
             if boost is not None:
@@ -1420,7 +1446,9 @@ class Bridge:
             return
         if prev == "ac" and cls != "ac":
             if cur * 100 // top > pct:
-                state_write(SAVED_NAME, str(cur))
+                # A level still waiting to go back (logind refused it) stays
+                # the barrel's level unless this one is brighter.
+                state_write(SAVED_NAME, str(max(cur, state_int(SAVED_NAME) or 0)))
                 self.set_backlight(dev, top * pct // 100)
         elif prev != "ac" and cls == "ac":
             # Kept until logind has set it: a refused write leaves it for

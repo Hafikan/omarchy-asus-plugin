@@ -108,7 +108,10 @@ applies PPT limits while the CPU custom fan curve is on; in auto fan mode a
 written limit is stored but ignored. So on a source with limits the widget
 enables asusd's stored CPU curve for the current profile, then writes the
 limits; leaving it turns the curve off and writes the defaults back. The fans
-follow that curve while limits apply. The values the G16 used with rog-power:
+follow that curve while limits apply. Each curve and tuning group the widget
+turns on is recorded in `~/.local/state/omarchy` before it's turned on, so a
+crash or a full disk never leaves one on that `release` can't find; if the
+record can't be written, nothing is turned on. The values the G16 used with rog-power:
 `PPT_USBC="25 30 40"`, `PPT_WEAK_BARREL="45 55 65"`, `BOOST_WEAK_BARREL=5`
 (the OEM barrel left at stock).
 
